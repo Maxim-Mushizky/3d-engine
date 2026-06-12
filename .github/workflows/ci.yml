@@ -29,8 +29,10 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
 
+      # CMake 4.x on the runner dropped compat with deps that request cmake < 3.5
+      # (glew-cmake); this is CMake's documented escape hatch for that.
       - name: Configure
-        run: cmake --preset mingw-release
+        run: cmake --preset mingw-release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
       - name: Build
         run: cmake --build --preset mingw-release
@@ -57,7 +59,7 @@ jobs:
             mingw-w64-x86_64-ninja
 
       - name: Configure (tests enabled)
-        run: cmake --preset mingw-release -DFORGE_BUILD_TESTS=ON
+        run: cmake --preset mingw-release -DFORGE_BUILD_TESTS=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
       # The test target links only glm (header-only), so this is fast and needs
       # no GL context — it does not rebuild the full engine.
