@@ -71,4 +71,4 @@ cmake --build --preset mingw-release
 
 ## License
 
-No license file yet — all rights reserved by the author until one is added.
+Released under the [MIT License](LICENSE). © 2026 Maxim Mushizky.
