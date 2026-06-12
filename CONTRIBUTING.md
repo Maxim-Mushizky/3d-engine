@@ -134,6 +134,51 @@ Forge **does not use C++ exceptions for its own control flow.** Two categories:
   methods with a banner comment (`// --- hierarchy ----`). No Doxygen ceremony.
 - Keep `docs/PLAN.md` in sync when an architectural decision changes.
 
+## Branching workflow
+
+`main` is always green — it must configure, build warning-clean, and launch at every commit.
+Never commit directly to `main`; all work happens on a short-lived branch off the latest `main`
+and lands through a pull request.
+
+**Branch naming** — `<type>/<short-kebab-description>`, matching the commit/changelog vocabulary:
+
+| Prefix | Use for | Example |
+|---|---|---|
+| `feature/` | new functionality | `feature/shadow-mapping` |
+| `bugfix/` | a defect fix | `bugfix/bvh-leaf-overflow` |
+| `refactor/` | behaviour-preserving cleanup | `refactor/renderer-submit-api` |
+| `docs/` | documentation only | `docs/contributing-branching` |
+| `chore/` | build, tooling, deps | `chore/bump-imgui` |
+
+Keep it lowercase and hyphenated; reference a milestone or issue when relevant
+(`feature/m5-path-tracer`).
+
+**Start a branch** — always branch from an up-to-date `main`:
+
+```powershell
+git checkout main
+git pull --ff-only origin main          # sync to remote first
+git checkout -b feature/shadow-mapping  # or bugfix/<name>, refactor/<name>, ...
+```
+
+**While you work** — commit in small, compiling steps (see below). Keep the branch current with
+`main` by rebasing, so history stays linear and easy to bisect:
+
+```powershell
+git fetch origin
+git rebase origin/main                  # resolve conflicts, re-test, continue
+```
+
+**Open the PR** — push the branch and open a pull request into `main`:
+
+```powershell
+git push -u origin feature/shadow-mapping
+```
+
+Before requesting review: `clang-format` clean, configures + builds warning-clean, the editor
+launches, and the new code logs at its boundaries (see *Logging is mandatory*). A PR that
+doesn't build won't be reviewed. Delete the branch after it merges.
+
 ## Commits & pull requests
 
 - Small, focused commits. Imperative subject ≤ ~72 chars ("Add directional shadow map"), with an
