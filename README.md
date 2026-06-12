@@ -31,6 +31,14 @@ progressive **GPU path-traced** render mode implemented as an OpenGL compute sha
 > **Status:** in development. See [`docs/PLAN.md`](docs/PLAN.md) for the full architecture
 > plan and [`docs/PLAN-M8-MODELING.md`](docs/PLAN-M8-MODELING.md) for the modeling roadmap.
 
+<div align="center">
+
+![Forge editor](images/intro_example.jpg)
+
+<sub><i>The Forge editor — dockable viewport, hierarchy, and inspector panels.</i></sub>
+
+</div>
+
 ---
 
 ## Features
