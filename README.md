@@ -100,6 +100,12 @@ cmake --build --preset mingw-release
 .\run.ps1                 # debug:  .\run.ps1 -Config debug
 ```
 
+## Contributing
+
+Contributions welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first — it covers the build,
+the house style (naming, class structure, RAII/ownership), the mandatory logging policy, and
+the error-handling rules.
+
 ## License
 
 Released under the [MIT License](LICENSE). © 2026 Maxim Mushizky.
