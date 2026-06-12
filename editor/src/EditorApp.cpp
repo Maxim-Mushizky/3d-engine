@@ -9,6 +9,7 @@
 #include <forge/core/Log.h>
 #include <forge/geometry/MeshEdit.h>
 #include <forge/geometry/MeshRemesh.h>
+#include <forge/scene/DropToGround.h>
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -362,6 +363,8 @@ void EditorApp::HandleShortcuts()
 
     if (ImGui::IsKeyPressed(ImGuiKey_Delete))
         DeleteSelected();
+    if (ImGui::IsKeyPressed(ImGuiKey_End))
+        DropSelectedToGround();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D))
         DuplicateSelected();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z))
@@ -1039,6 +1042,71 @@ void EditorApp::SubdivideSelected(bool keepShape)
                before->Indices().size() / 3, after->Indices().size() / 3);
 }
 
+void EditorApp::DropSelectedToGround()
+{
+    if (m_Selection.empty())
+        return;
+
+    auto worldAABB = [this](UUID node) {
+        AABB box;
+        Entity* e = m_Scene.Find(node);
+        if (!e || !e->mesh)
+            return box;
+        mat4 world = m_Scene.WorldTransform(node);
+        const AABB& lb = e->mesh->Bounds();
+        for (int c = 0; c < 8; ++c) {
+            vec3 corner{(c & 1) ? lb.max.x : lb.min.x, (c & 2) ? lb.max.y : lb.min.y,
+                        (c & 4) ? lb.max.z : lb.min.z};
+            box.Expand(vec3(world * vec4(corner, 1.0f)));
+        }
+        return box;
+    };
+
+    auto composite = std::make_unique<CompositeCommand>();
+    // Sequential: dropping a multi-selection one root at a time lets later
+    // objects land on earlier ones (a loose stack settles into a stack).
+    for (UUID id : m_Selection) {
+        Entity* root = m_Scene.Find(id);
+        if (!root)
+            continue;
+        std::vector<UUID> subtree = SubtreeOf(id);
+
+        AABB box; // groups move as one unit: combined AABB of the subtree
+        for (UUID node : subtree) {
+            AABB nb = worldAABB(node);
+            if (nb.Valid()) {
+                box.Expand(nb.min);
+                box.Expand(nb.max);
+            }
+        }
+        if (!box.Valid())
+            continue; // nothing meshy under this root
+
+        std::vector<AABB> supports;
+        for (const Entity& e : m_Scene.Entities()) {
+            if (!e.mesh || e.light.enabled) // light gizmos are not surfaces
+                continue;
+            if (std::find(subtree.begin(), subtree.end(), e.id) != subtree.end())
+                continue;
+            AABB sb = worldAABB(e.id);
+            if (sb.Valid())
+                supports.push_back(sb);
+        }
+
+        float dy = DropOffsetY(box, supports);
+        if (std::abs(dy) < 1e-6f)
+            continue; // already resting
+
+        Entity before = *root;
+        // The offset is world-space; a parented root needs it in parent space.
+        mat4 parentWorld = m_Scene.WorldTransform(root->parent);
+        root->transform.translation += vec3(glm::inverse(parentWorld) * vec4(0.0f, dy, 0.0f, 0.0f));
+        composite->Add(std::make_unique<EditEntityCommand>(before, *root));
+    }
+    if (!composite->Empty())
+        m_Commands.Push(std::move(composite));
+}
+
 void EditorApp::RemeshSelected()
 {
     Entity* e = m_Scene.Find(m_Selected);
@@ -1463,6 +1531,12 @@ void EditorApp::DrawSidebar()
         bool canModify = sel && sel->mesh && !sel->light.enabled;
         size_t triCount = canModify ? sel->mesh->Indices().size() / 3 : 0;
         bool tooDense = triCount * 4 > 100000; // subdivision quadruples the count
+
+        ImGui::BeginDisabled(m_Selection.empty());
+        if (ImGui::Button("Drop to Ground", ImVec2(-1, 30)))
+            DropSelectedToGround();
+        ImGui::SetItemTooltip("Rest the selection on the floor or whatever is under it (End)");
+        ImGui::EndDisabled();
 
         ImGui::BeginDisabled(!canModify);
         if (ImGui::Button("Mirror X", ImVec2(-1, 30)))

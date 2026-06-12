@@ -7,6 +7,7 @@ void RunGeometryTests();
 void RunUuidTests();
 void RunSceneFormatTests();
 void RunBoxSelectTests();
+void RunDropToGroundTests();
 } // namespace forge::test
 
 int main()
@@ -17,6 +18,7 @@ int main()
     RunUuidTests();
     RunSceneFormatTests();
     RunBoxSelectTests();
+    RunDropToGroundTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");

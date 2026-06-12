@@ -45,6 +45,7 @@ private:
     void LoadHDRI();
     void MirrorSelected();   // bake X-mirror into the selected mesh (undoable)
     void SubdivideSelected(bool keepShape);
+    void DropSelectedToGround(); // rest each selected root on the surface below it
     void RemeshSelected();
     void BooleanSelected(BooleanOp op); // first selected (op) second selected
     void ExportStlDialog();  // save dialog + export selection (or whole scene)
