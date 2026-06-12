@@ -10,7 +10,10 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, rgba32f) uniform image2D u_Accum;
-layout(binding = 1, rgba8) uniform writeonly image2D u_Display;
+// Denoiser guide buffers, written on the first sub-sample of each dispatch.
+// Display output moved to resolve.comp (which tonemaps raw or filtered radiance).
+layout(binding = 2, rgba16f) uniform writeonly image2D u_GuideAlbedo;
+layout(binding = 3, rgba16f) uniform writeonly image2D u_GuideNormalDepth; // xyz = normal, w = primary t (1e30 sky)
 
 // 6 vec4 per triangle: v0(w=material), v1, v2, n0, n1, n2
 layout(std430, binding = 2) readonly buffer Triangles { vec4 b_Tris[]; };
@@ -21,6 +24,10 @@ layout(std430, binding = 4) readonly buffer Materials { vec4 b_Mats[]; };
 
 uniform mat4 u_InvViewProj;
 uniform vec3 u_CamPos;
+uniform float u_Aperture;  // lens radius in world units; 0 = pinhole
+uniform float u_FocusDist; // distance to the sharp plane along the view ray
+uniform vec3 u_CamRight;   // lens disc basis (camera plane)
+uniform vec3 u_CamUp;
 uniform int u_SampleIndex;
 uniform int u_FrameIndex; // monotonic — independent of accumulation restarts
 uniform int u_SamplesPerPass;
@@ -187,12 +194,16 @@ vec3 sky(vec3 d, bool includeSun, float envLod)
 }
 
 // ---------------------------------------------------------------------------
-vec3 tracePath(vec3 ro, vec3 rd, inout uint seed)
+vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
+               out vec3 firstAlbedo, out vec3 firstNormal, out float firstT)
 {
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     bool specularRay = true; // sun disc only visible to camera/mirror rays (NEE covers diffuse)
     float envLod = 0.0;
+    firstAlbedo = vec3(1.0); // sky default: uniform albedo lets sky pixels filter together
+    firstNormal = vec3(0.0);
+    firstT = 1e30;
 
     for (int bounce = 0; bounce < u_MaxBounces; ++bounce) {
         Hit h;
@@ -216,6 +227,12 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed)
         vec3 gn = dot(rd, h.gn) < 0.0 ? h.gn : -h.gn;
         vec3 n = dot(h.n, gn) < 0.0 ? -h.n : h.n;
         vec3 pos = ro + rd * h.t + gn * 2e-3;
+
+        if (bounce == 0) { // denoiser guides: exact first-hit data
+            firstAlbedo = albedo;
+            firstNormal = n;
+            firstT = h.t;
+        }
 
         {
             vec3 c = throughput * emissive; // glowing surfaces are area lights
@@ -280,6 +297,8 @@ void main()
         return;
 
     vec3 sum = vec3(0.0);
+    vec3 guideAlbedo = vec3(1.0), guideNormal = vec3(0.0);
+    float guideT = 1e30;
     for (int s = 0; s < u_SamplesPerPass; ++s) {
         // Seed from the monotonic frame index so noise changes per frame while
         // the camera moves instead of freezing into a static pattern.
@@ -294,16 +313,30 @@ void main()
         vec3 ro = pNear.xyz / pNear.w;
         vec3 rd = normalize(pFar.xyz / pFar.w - ro);
 
-        sum += tracePath(ro, rd, seed);
+        // Thin lens: jitter the ray origin across the aperture disc, re-aim at
+        // the focal point so the focus plane stays sharp and everything else blurs.
+        if (u_Aperture > 0.0) {
+            vec3 focalPoint = ro + rd * u_FocusDist;
+            float r = u_Aperture * sqrt(rand(seed));
+            float phi = 6.28318530718 * rand(seed);
+            ro += u_CamRight * (r * cos(phi)) + u_CamUp * (r * sin(phi));
+            rd = normalize(focalPoint - ro);
+        }
+
+        vec3 sa, sn;
+        float st;
+        sum += tracePath(ro, rd, seed, sa, sn, st);
+        if (s == 0) {
+            guideAlbedo = sa;
+            guideNormal = sn;
+            guideT = st;
+        }
     }
 
     vec4 prev = u_SampleIndex > 0 ? imageLoad(u_Accum, px) : vec4(0.0);
     vec4 acc = prev + vec4(sum, float(u_SamplesPerPass));
     imageStore(u_Accum, px, acc);
 
-    // Same ACES fit as the raster post stack so toggling modes doesn't shift brightness.
-    vec3 color = acc.rgb / float(u_SampleIndex + u_SamplesPerPass);
-    color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
-    color = pow(color, vec3(1.0 / 2.2));
-    imageStore(u_Display, px, vec4(color, 1.0));
+    imageStore(u_GuideAlbedo, px, vec4(guideAlbedo, 1.0));
+    imageStore(u_GuideNormalDepth, px, vec4(guideNormal, guideT));
 }

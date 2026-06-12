@@ -1,0 +1,76 @@
+#version 460 core
+
+// One à-trous wavelet iteration (SVGF-lite, spatial only): 5x5 B3-spline kernel
+// with holes of u_StepSize, edge-stopped by first-hit normal, depth, albedo and
+// luminance. Run 4x with steps 1,2,4,8; ping-pong color between iterations.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba32f) uniform readonly image2D u_Accum;   // raw sum + count (first pass source)
+layout(binding = 1, rgba16f) uniform readonly image2D u_ColorIn; // previous iteration
+layout(binding = 2, rgba16f) uniform writeonly image2D u_ColorOut;
+layout(binding = 3, rgba16f) uniform readonly image2D u_GuideAlbedo;
+layout(binding = 4, rgba16f) uniform readonly image2D u_GuideNormalDepth;
+
+uniform int u_StepSize;
+uniform int u_FirstPass; // 1 = read mean radiance from u_Accum instead of u_ColorIn
+uniform float u_Spp;     // samples accumulated so far (narrows the luminance weight)
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 fetchColor(ivec2 p)
+{
+    if (u_FirstPass == 1) {
+        vec4 a = imageLoad(u_Accum, p);
+        return a.rgb / max(a.w, 1.0);
+    }
+    return imageLoad(u_ColorIn, p).rgb;
+}
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_ColorOut);
+    if (px.x >= size.x || px.y >= size.y)
+        return;
+
+    vec4 cND = imageLoad(u_GuideNormalDepth, px);
+    vec3 cCol = fetchColor(px);
+    if (cND.w >= 1e29) { // sky: HDRIs are noise-free already, pass through
+        imageStore(u_ColorOut, px, vec4(cCol, 1.0));
+        return;
+    }
+    vec3 cAlb = imageLoad(u_GuideAlbedo, px).rgb;
+    float cLum = luma(cCol);
+
+    // Noisy early frames need wide luminance acceptance; tighten as spp grows
+    // so converged detail stops being smeared.
+    float lumScale = sqrt(max(u_Spp, 1.0)) / 4.0;
+
+    const float kernel[3] = float[](3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+    vec3 sum = vec3(0.0);
+    float wSum = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            ivec2 q = px + ivec2(dx, dy) * u_StepSize;
+            if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+                continue;
+            vec4 qND = imageLoad(u_GuideNormalDepth, q);
+            if (qND.w >= 1e29)
+                continue; // never pull sky into surfaces
+            vec3 qCol = fetchColor(q);
+            vec3 qAlb = imageLoad(u_GuideAlbedo, q).rgb;
+
+            float wK = kernel[abs(dx)] * kernel[abs(dy)];
+            float wN = pow(max(dot(cND.xyz, qND.xyz), 0.0), 128.0);
+            float wD = exp(-abs(cND.w - qND.w) / (cND.w + 1e-3));
+            float wL = exp(-abs(luma(qCol) - cLum) * lumScale);
+            vec3 dA = abs(qAlb - cAlb);
+            float wA = max(dA.r, max(dA.g, dA.b)) < 0.05 ? 1.0 : 0.0; // hard cut keeps texture-free material borders crisp
+            float w = wK * wN * wD * wL * wA;
+            sum += qCol * w;
+            wSum += w;
+        }
+    }
+    imageStore(u_ColorOut, px, vec4(wSum > 1e-6 ? sum / wSum : cCol, 1.0));
+}

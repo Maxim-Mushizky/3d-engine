@@ -18,7 +18,7 @@ class EditorCamera;
 // One stroke (press -> release) = one undo step (sparse vertex diff).
 class SculptTool {
 public:
-    enum class Brush { Draw, Smooth, Grab, Inflate };
+    enum class Brush { Draw, Smooth, Grab, Inflate, Flatten, Pinch };
 
     bool Active() const { return m_Active; }
     UUID Target() const { return m_Target; }
@@ -42,6 +42,7 @@ private:
 
     bool m_Active = false;
     UUID m_Target = 0;
+    Mesh* m_MeshAtEnter = nullptr; // topology guard: mesh swapped (undo of a topology op) -> exit
     MeshTopology m_Topology;
 
     Brush m_Brush = Brush::Draw;

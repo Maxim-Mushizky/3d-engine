@@ -2,8 +2,10 @@
 
 #include "CommandStack.h"
 #include "EditorCamera.h"
+#include "ExtrudeTool.h"
 #include "SculptTool.h"
 
+#include <forge/geometry/MeshBoolean.h>
 #include <forge/platform/Window.h>
 #include <forge/raytrace/PathTracer.h>
 #include <forge/renderer/Framebuffer.h>
@@ -12,8 +14,10 @@
 #include <forge/scene/Scene.h>
 
 #include <memory>
+#include <string>
 
 struct ImFont;
+struct ForgeGifWriter; // wraps gif-h's GifWriter; gif.h is included only in EditorApp.cpp
 
 namespace forge {
 
@@ -38,6 +42,18 @@ private:
     void SpawnPrimitive(const char* baseName, const std::shared_ptr<Mesh>& mesh, float yOffset);
     void SpawnPointLight();
     void LoadHDRI();
+    void MirrorSelected();   // bake X-mirror into the selected mesh (undoable)
+    void SubdivideSelected(bool keepShape);
+    void RemeshSelected();
+    void BooleanSelected(BooleanOp op); // first selected (op) second selected
+    void ExportStlDialog();  // save dialog + export selection (or whole scene)
+
+    // Turntable GIF: amortized over UI frames (never blocks the loop).
+    void StartTurntableDialog();
+    bool StartTurntable(const std::string& path, int frames, int sppTarget);
+    void UpdateTurntable(); // one Dispatch slice per UI frame; writes a GIF frame when converged
+    void FinishTurntable();
+    void DrawTurntableModal();
 
     // selection (multi-select: last = primary, drives gizmo/inspector)
     void SelectOnly(UUID id);
@@ -78,6 +94,7 @@ private:
     ImFont* m_BodyFont = nullptr;
     ImFont* m_HeaderFont = nullptr;
     SculptTool m_Sculpt;
+    ExtrudeTool m_Extrude;
     GizmoOp m_GizmoOp = GizmoOp::Translate;
     bool m_GizmoWasUsing = false;
     Entity m_BeforeEdit; // snapshot taken when a gizmo drag / widget edit begins
@@ -97,6 +114,28 @@ private:
     bool m_RayTracing = false;
     PathTracer m_PathTracer;
     int m_Bounces = 4;
+    bool m_Denoise = true;
+    float m_DenoiseStrength = 0.7f;
+    float m_Aperture = 0.0f;    // 0 = DOF off
+    float m_FocusDist = -1.0f;  // <0 = uninitialized; defaults to the orbit distance
+    float m_LastAperture = 0.0f, m_LastFocusDist = -1.0f;
+    float m_StlScale = 100.0f;  // mm per scene unit
+    std::string m_StlStatus;    // last export outcome, shown under the button
+    bool m_SubdivKeepShape = false;
+    int m_RemeshDetail = 64; // 96+ gets very dense (a cube remeshes to ~150k tris at 96)
+    std::string m_BoolStatus; // last boolean error, shown in the Modify section
+    char m_TextInput[64] = "Forge";
+    float m_TextDepth = 0.25f;
+
+    struct TurntableJob {
+        bool active = false;
+        int frame = 0, totalFrames = 48;
+        int sppDone = 0, sppTarget = 128;
+        float baseYaw = 0.0f, pitch = 0.0f;
+        EditorCamera::Bookmark restore{};
+        ForgeGifWriter* writer = nullptr;
+    };
+    TurntableJob m_Turntable;
     float m_RTScale = 0.75f;          // render-resolution fraction (Intel Arc relief)
     double m_RTSettleAt = 0.0;        // geometry edits suspend RT until this time
     bool m_RTUploadPending = false;   // BVH rebuild deferred until the scene settles

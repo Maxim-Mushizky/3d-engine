@@ -30,6 +30,7 @@ void SculptTool::Enter(Scene& scene, UUID entity)
 
     m_Topology = MeshTopology::Build(*e->mesh);
     m_Target = entity;
+    m_MeshAtEnter = e->mesh.get();
     m_Active = true;
     m_Stroking = false;
     FORGE_INFO("Sculpt: %s (%zu verts, %zu weld groups)", e->name.c_str(),
@@ -41,6 +42,7 @@ void SculptTool::Exit()
     m_Active = false;
     m_Stroking = false;
     m_Target = 0;
+    m_MeshAtEnter = nullptr;
     m_Topology = {};
 }
 
@@ -64,6 +66,8 @@ void SculptTool::DrawSettingsUI()
     brushButton("Smooth", Brush::Smooth, "Relax bumps and wrinkles", false);
     brushButton("Grab", Brush::Grab, "Drag a region around", true);
     brushButton("Inflate", Brush::Inflate, "Puff the surface outward", false);
+    brushButton("Flatten", Brush::Flatten, "Press the surface toward an even plane", true);
+    brushButton("Pinch", Brush::Pinch, "Gather the surface toward the brush center (Ctrl spreads)", false);
 
     ImGui::SliderFloat("Radius", &m_Radius, 0.05f, 2.0f);
     ImGui::SetItemTooltip("Size of the brush circle");
@@ -144,16 +148,48 @@ void SculptTool::ApplyDab(Entity& e, const vec3& localPos, const vec3& localDir,
 {
     auto& verts = e.mesh->MutableVertices();
 
+    // Gather the affected region BEFORE moving anything: Flatten fits its plane
+    // to pre-move positions once per dab (fitting per-vertex would chase the
+    // dab's own edits and jitter).
+    struct Affected {
+        uint32_t group;
+        float w;
+    };
+    std::vector<Affected> region;
+    region.reserve(64);
     for (size_t g = 0; g < m_Topology.groups.size(); ++g) {
-        const auto& group = m_Topology.groups[g];
-        const vec3& rep = verts[group[0]].position;
+        const vec3& rep = verts[m_Topology.groups[g][0]].position;
         float w = Falloff(glm::length(rep - localPos) / localRadius);
-        if (w <= 0.001f)
-            continue;
+        if (w > 0.001f)
+            region.push_back({(uint32_t)g, w});
+    }
+    if (region.empty())
+        return;
+
+    vec3 planePoint(0.0f), planeNormal(0.0f);
+    if (!smoothMode && m_Brush == Brush::Flatten) {
+        float wSum = 0.0f;
+        for (const Affected& a : region) {
+            uint32_t i0 = m_Topology.groups[a.group][0];
+            planePoint += verts[i0].position * a.w;
+            planeNormal += verts[i0].normal * a.w;
+            wSum += a.w;
+        }
+        planePoint /= wSum;
+        float len = glm::length(planeNormal);
+        if (len < 1e-8f)
+            return; // normals cancelled (e.g. a full sphere) — no meaningful plane
+        planeNormal /= len;
+    }
+
+    for (const Affected& a : region) {
+        const auto& group = m_Topology.groups[a.group];
+        const vec3& rep = verts[group[0]].position;
+        float w = a.w;
 
         vec3 newPos;
         if (smoothMode || m_Brush == Brush::Smooth) {
-            const auto& neighbors = m_Topology.groupNeighbors[g];
+            const auto& neighbors = m_Topology.groupNeighbors[a.group];
             if (neighbors.empty())
                 continue;
             vec3 avg(0.0f);
@@ -163,6 +199,16 @@ void SculptTool::ApplyDab(Entity& e, const vec3& localPos, const vec3& localDir,
             newPos = glm::mix(rep, avg, glm::clamp(w * m_Strength * 1.5f, 0.0f, 1.0f));
         } else if (m_Brush == Brush::Inflate) {
             newPos = rep + verts[group[0]].normal * (amount * w);
+        } else if (m_Brush == Brush::Flatten) {
+            float d = glm::dot(rep - planePoint, planeNormal);
+            newPos = rep - planeNormal * (d * glm::clamp(m_Strength * w, 0.0f, 1.0f));
+        } else if (m_Brush == Brush::Pinch) {
+            vec3 toCenter = localPos - rep;
+            vec3 tang = toCenter - localDir * glm::dot(toCenter, localDir);
+            float side = amount < 0.0f ? -1.0f : 1.0f; // Ctrl inverts: spread
+            // 0.5 cap: pulling further than halfway collapses rings of vertices
+            // into zero-area pleats.
+            newPos = rep + tang * (side * glm::clamp(m_Strength * w * 0.5f, 0.0f, 0.5f));
         } else { // Draw
             newPos = rep + localDir * (amount * w);
         }
@@ -180,6 +226,10 @@ std::unique_ptr<Command> SculptTool::OnViewportFrame(Scene& scene, const EditorC
         return nullptr;
     Entity* e = scene.Find(m_Target);
     if (!e || !e->mesh) { // target deleted under us
+        Exit();
+        return nullptr;
+    }
+    if (e->mesh.get() != m_MeshAtEnter) { // mesh swapped (topology-op undo/redo): topology is stale
         Exit();
         return nullptr;
     }

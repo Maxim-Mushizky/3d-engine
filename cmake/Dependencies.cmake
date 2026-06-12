@@ -52,7 +52,21 @@ FetchContent_Declare(tinyobjloader
     GIT_TAG v2.0.0rc13
     GIT_SHALLOW TRUE)
 
-FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader)
+# --- Manifold (boolean ops; Apache-2.0, zero deps with these flags) -----------
+set(MANIFOLD_TEST OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_CBIND OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_PYBIND OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_JSBIND OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_CROSS_SECTION OFF CACHE BOOL "" FORCE) # drops Clipper2
+set(MANIFOLD_PAR OFF CACHE BOOL "" FORCE)           # no TBB
+set(MANIFOLD_DOWNLOADS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)      # required on Windows
+FetchContent_Declare(manifold
+    GIT_REPOSITORY https://github.com/elalish/manifold.git
+    GIT_TAG v3.5.1
+    GIT_SHALLOW TRUE)
+
+FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader manifold)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp

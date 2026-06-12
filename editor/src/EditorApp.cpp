@@ -4,7 +4,10 @@
 
 #include <forge/assets/AssetManager.h>
 #include <forge/assets/MeshFactory.h>
+#include <forge/assets/StlExporter.h>
 #include <forge/core/Log.h>
+#include <forge/geometry/MeshEdit.h>
+#include <forge/geometry/MeshRemesh.h>
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -14,7 +17,17 @@
 #include <backends/imgui_impl_opengl3.h>
 #include <ImGuizmo.h>
 
+#include <gif.h> // single TU only: gif-h's functions are not inline
+
+// gif-h's GifWriter is an anonymous-struct typedef, so it can't be forward
+// declared — this wrapper gives the header a nameable opaque type.
+struct ForgeGifWriter {
+    GifWriter w{};
+};
+
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <unordered_map>
 
@@ -66,6 +79,7 @@ EditorApp::EditorApp()
     cube.mesh = m_CubeMesh;
     cube.transform.translation = {0.0f, 0.5f, 0.0f};
     cube.material.albedo = {0.85f, 0.35f, 0.25f};
+
 }
 
 EditorApp::~EditorApp()
@@ -105,8 +119,10 @@ void EditorApp::Run()
         // Raster while sculpting: mid-stroke mesh edits would otherwise trigger a
         // BVH rebuild every frame. Same for geometry edits in RT mode: raster
         // preview until the scene settles (m_RTUploadPending).
-        bool rtActive = m_RayTracing && !m_Sculpt.Active();
-        if (rtActive)
+        bool rtActive = (m_RayTracing && !m_Sculpt.Active()) || m_Turntable.active;
+        if (m_Turntable.active)
+            UpdateTurntable(); // drives the path tracer directly, bypasses settle logic
+        else if (rtActive)
             UpdateRayTracer();
         if (!rtActive || m_RTUploadPending)
             RenderScene();
@@ -215,16 +231,28 @@ void EditorApp::UpdateRayTracer()
     bool envChanged = std::memcmp(envState, lastEnvState, sizeof(envState)) != 0;
     std::memcpy(lastEnvState, envState, sizeof(envState));
 
+    // Thin-lens DOF. Ortho has parallel rays — no lens point, force pinhole.
+    if (m_FocusDist <= 0.0f)
+        m_FocusDist = glm::length(m_Camera.FocalPoint() - m_Camera.Position());
+    float aperture = m_Camera.IsOrthographic() ? 0.0f : m_Aperture;
+    const mat4& view = m_Camera.View();
+    m_PathTracer.SetLens(aperture, m_FocusDist, vec3(view[0][0], view[1][0], view[2][0]),
+                         vec3(view[0][1], view[1][1], view[2][1]));
+
     mat4 viewProj = m_Camera.ViewProjection();
     bool reset = viewProj != m_LastViewProj || std::memcmp(&m_Sun, &m_LastSun, sizeof(m_Sun)) != 0 ||
-                 m_Bounces != m_LastBounces || envChanged;
+                 m_Bounces != m_LastBounces || envChanged || aperture != m_LastAperture ||
+                 m_FocusDist != m_LastFocusDist;
     if (reset)
         m_PathTracer.ResetAccumulation();
     m_LastViewProj = viewProj;
     m_LastSun = m_Sun;
     m_LastBounces = m_Bounces;
+    m_LastAperture = aperture;
+    m_LastFocusDist = m_FocusDist;
 
     // 1 spp while interacting (latency), 4 spp while converging (4x faster).
+    m_PathTracer.SetDenoise(m_Denoise, m_DenoiseStrength);
     m_PathTracer.Dispatch(viewProj, m_Camera.Position(), m_Sun, m_Bounces, m_FrameLights, m_Env.get(),
                           reset ? 1 : 4);
 }
@@ -466,6 +494,249 @@ void EditorApp::ImportModel(const std::string& path)
     m_Commands.Push(std::move(composite));
 }
 
+void EditorApp::MirrorSelected()
+{
+    Entity* e = m_Scene.Find(m_Selected);
+    if (!e || !e->mesh)
+        return;
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit(); // topology is about to change under the sculpt tool
+
+    int crossing = 0;
+    for (const Vertex& v : e->mesh->Vertices())
+        if (v.position.x < -1e-4f)
+            ++crossing;
+    if (crossing)
+        FORGE_WARN("Mirror X: %d vertices already at x<0 kept as-is (no clipping in v1)", crossing);
+
+    std::shared_ptr<Mesh> before = e->mesh;
+    std::shared_ptr<Mesh> after = MirrorBakeX(*before);
+    e->mesh = after; // pointer change bumps the RT scene hash automatically
+    m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
+}
+
+void EditorApp::SubdivideSelected(bool keepShape)
+{
+    Entity* e = m_Scene.Find(m_Selected);
+    if (!e || !e->mesh)
+        return;
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit(); // topology is about to change under the sculpt tool
+
+    std::shared_ptr<Mesh> before = e->mesh;
+    std::shared_ptr<Mesh> after = LoopSubdivide(*before, keepShape);
+    e->mesh = after;
+    m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
+    FORGE_INFO("Subdivide (%s): %zu -> %zu tris", keepShape ? "keep shape" : "smooth",
+               before->Indices().size() / 3, after->Indices().size() / 3);
+}
+
+void EditorApp::RemeshSelected()
+{
+    Entity* e = m_Scene.Find(m_Selected);
+    if (!e || !e->mesh)
+        return;
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit();
+
+    std::shared_ptr<Mesh> before = e->mesh;
+    std::shared_ptr<Mesh> after = VoxelRemesh(*before, m_RemeshDetail);
+    if (!after) {
+        FORGE_ERROR("Remesh failed (degenerate or empty mesh)");
+        return;
+    }
+    e->mesh = after;
+    m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
+}
+
+void EditorApp::BooleanSelected(BooleanOp op)
+{
+    if (m_Selection.size() != 2)
+        return;
+    Entity* pa = m_Scene.Find(m_Selection[0]);
+    Entity* pb = m_Scene.Find(m_Selection[1]);
+    if (!pa || !pb || !pa->mesh || !pb->mesh)
+        return;
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit();
+
+    // Snapshot by value: CreateEntity/Remove below invalidate entity pointers.
+    Entity ea = *pa, eb = *pb;
+    BooleanResult r = MeshBoolean(*ea.mesh, m_Scene.WorldTransform(ea.id), *eb.mesh,
+                                  m_Scene.WorldTransform(eb.id), op);
+    if (!r.mesh) {
+        m_BoolStatus = r.error;
+        return;
+    }
+    m_BoolStatus.clear();
+
+    auto composite = std::make_unique<CompositeCommand>();
+    composite->Add(std::make_unique<DeleteEntityCommand>(ea));
+    m_Scene.Remove(ea.id);
+    composite->Add(std::make_unique<DeleteEntityCommand>(eb));
+    m_Scene.Remove(eb.id);
+
+    const char* opName = op == BooleanOp::Union      ? "Union"
+                         : op == BooleanOp::Subtract ? "Subtract"
+                                                     : "Intersect";
+    Entity& result = m_Scene.CreateEntity(std::string(opName) + " " + std::to_string(m_SpawnCounter++));
+    result.mesh = r.mesh;          // world-space baked
+    result.material = ea.material; // first object's look carries over
+    composite->Add(std::make_unique<AddEntityCommand>(result));
+    UUID resultId = result.id;
+
+    m_Commands.Push(std::move(composite));
+    SelectOnly(resultId);
+}
+
+void EditorApp::StartTurntableDialog()
+{
+    std::string path = SaveFileDialog(m_Window.NativeHandle(), "GIF animation\0*.gif\0", "gif");
+    if (!path.empty())
+        StartTurntable(path, 48, 128);
+}
+
+bool EditorApp::StartTurntable(const std::string& path, int frames, int sppTarget)
+{
+    if (m_Turntable.active)
+        return false;
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit();
+
+    // Fresh upload: the user may never have toggled RT on this session.
+    m_PathTracer.Resize((uint32_t)(m_ViewportSize.x * m_RTScale), (uint32_t)(m_ViewportSize.y * m_RTScale));
+    m_PathTracer.Upload(m_Scene);
+    m_RTUploadPending = false;
+    m_LastSceneHash = 0; // force re-upload when normal RT resumes afterwards
+    GatherLights();
+
+    TurntableJob& job = m_Turntable;
+    job = {};
+    job.totalFrames = frames;
+    job.sppTarget = sppTarget;
+    job.restore = m_Camera.GetBookmark();
+    job.baseYaw = job.restore.yaw;
+    job.pitch = job.restore.pitch;
+    job.writer = new ForgeGifWriter{};
+    if (!GifBegin(&job.writer->w, path.c_str(), m_PathTracer.Width(), m_PathTracer.Height(), 4)) {
+        FORGE_ERROR("Turntable: could not open %s for writing", path.c_str());
+        delete job.writer;
+        job.writer = nullptr;
+        return false;
+    }
+    job.active = true;
+    FORGE_INFO("Turntable: %d frames at %ux%u, %d spp -> %s", frames, m_PathTracer.Width(),
+               m_PathTracer.Height(), sppTarget, path.c_str());
+    return true;
+}
+
+void EditorApp::UpdateTurntable()
+{
+    TurntableJob& job = m_Turntable;
+    if (!job.active)
+        return;
+
+    if (job.sppDone == 0) { // new frame: spin the camera, restart accumulation
+        m_Camera.SetOrbit(job.pitch,
+                          job.baseYaw + glm::two_pi<float>() * (float)job.frame / (float)job.totalFrames);
+        m_PathTracer.ResetAccumulation();
+    }
+
+    if (m_FocusDist <= 0.0f)
+        m_FocusDist = glm::length(m_Camera.FocalPoint() - m_Camera.Position());
+    const mat4& view = m_Camera.View();
+    m_PathTracer.SetLens(m_Camera.IsOrthographic() ? 0.0f : m_Aperture, m_FocusDist,
+                         vec3(view[0][0], view[1][0], view[2][0]), vec3(view[0][1], view[1][1], view[2][1]));
+    m_PathTracer.SetDenoise(m_Denoise, m_DenoiseStrength);
+
+    // ~8 spp per UI frame keeps the app responsive while converging.
+    m_PathTracer.Dispatch(m_Camera.ViewProjection(), m_Camera.Position(), m_Sun, m_Bounces, m_FrameLights,
+                          m_Env.get(), 8);
+    job.sppDone += 8;
+    if (job.sppDone < job.sppTarget)
+        return;
+
+    // Frame converged: read back the display image (GL is bottom-up; flip rows).
+    uint32_t w = m_PathTracer.Width(), h = m_PathTracer.Height();
+    std::vector<uint8_t> pixels((size_t)w * h * 4), flipped((size_t)w * h * 4);
+    glBindTexture(GL_TEXTURE_2D, m_PathTracer.DisplayTexture());
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+    for (uint32_t y = 0; y < h; ++y)
+        std::memcpy(&flipped[(size_t)y * w * 4], &pixels[(size_t)(h - 1 - y) * w * 4], (size_t)w * 4);
+    GifWriteFrame(&job.writer->w, flipped.data(), w, h, 4);
+
+    job.sppDone = 0;
+    if (++job.frame >= job.totalFrames)
+        FinishTurntable();
+}
+
+void EditorApp::FinishTurntable()
+{
+    TurntableJob& job = m_Turntable;
+    if (!job.active)
+        return;
+    GifEnd(&job.writer->w); // canceling keeps the partial GIF — frames written so far still play
+    delete job.writer;
+    job.writer = nullptr;
+    job.active = false;
+    m_Camera.ApplyBookmark(job.restore);
+    FORGE_INFO("Turntable: wrote %d frames", job.frame);
+}
+
+void EditorApp::DrawTurntableModal()
+{
+    if (m_Turntable.active)
+        ImGui::OpenPopup("Rendering Turntable");
+    if (ImGui::BeginPopupModal("Rendering Turntable", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        TurntableJob& job = m_Turntable;
+        float progress = job.active
+                             ? ((float)job.frame + (float)job.sppDone / (float)job.sppTarget) / (float)job.totalFrames
+                             : 1.0f;
+        ImGui::ProgressBar(progress, ImVec2(280, 0));
+        ImGui::Text("Frame %d / %d", std::min(job.frame + 1, job.totalFrames), job.totalFrames);
+        if (ImGui::Button("Cancel", ImVec2(-1, 0)))
+            FinishTurntable();
+        if (!job.active)
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+void EditorApp::ExportStlDialog()
+{
+    std::string path = SaveFileDialog(m_Window.NativeHandle(), "STL (3D printing)\0*.stl\0", "stl");
+    if (path.empty())
+        return;
+
+    // Selection (with subtrees) when present, whole scene otherwise.
+    std::vector<UUID> ids;
+    if (!m_Selection.empty()) {
+        for (UUID id : m_Selection)
+            for (UUID node : SubtreeOf(id))
+                if (std::find(ids.begin(), ids.end(), node) == ids.end())
+                    ids.push_back(node);
+    } else {
+        for (const Entity& e : m_Scene.Entities())
+            ids.push_back(e.id);
+    }
+
+    StlExportResult r = ExportStl(m_Scene, ids, path, m_StlScale);
+    if (!r.ok) {
+        m_StlStatus = r.error;
+        return;
+    }
+    char buf[192];
+    if (r.watertight)
+        std::snprintf(buf, sizeof(buf), "Exported %u triangles - watertight, print-ready.", r.triangles);
+    else
+        std::snprintf(buf, sizeof(buf),
+                      "Exported %u triangles - NOT watertight (%u open, %u flipped edges). "
+                      "A slicer may need to repair it.",
+                      r.triangles, r.openEdges, r.flippedEdges);
+    m_StlStatus = buf;
+}
+
 void EditorApp::DeleteSelected()
 {
     if (m_Selection.empty())
@@ -632,6 +903,25 @@ void EditorApp::DrawSidebar()
         if (ImGui::Button("Terrain", ImVec2(-1, 32)))
             SpawnPrimitive("Terrain", m_TerrainMesh, 0.01f);
         ImGui::SetItemTooltip("A flat ground you can sculpt into hills");
+        if (ImGui::Button("3D Text...", ImVec2(-1, 32)))
+            ImGui::OpenPopup("Add 3D Text");
+        ImGui::SetItemTooltip("Turn a word into a solid 3D object (great for nameplates)");
+        if (ImGui::BeginPopupModal("Add 3D Text", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("Text", m_TextInput, sizeof(m_TextInput));
+            ImGui::SliderFloat("Depth", &m_TextDepth, 0.05f, 1.0f);
+            bool create = ImGui::Button("Create", ImVec2(120, 0)) && m_TextInput[0];
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0)))
+                ImGui::CloseCurrentPopup();
+            if (create) {
+                if (auto mesh = MeshFactory::Text(m_TextInput, "C:/Windows/Fonts/segoeui.ttf", m_TextDepth))
+                    SpawnPrimitive(m_TextInput, mesh, 0.5f);
+                else
+                    FORGE_ERROR("3D text failed (font missing or unsupported outline format)");
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
 
         ImGui::Spacing();
         ui::PushAccentButton();
@@ -658,6 +948,80 @@ void EditorApp::DrawSidebar()
         ImGui::EndDisabled();
         if (m_Sculpt.Active())
             m_Sculpt.DrawSettingsUI();
+    }
+
+    if (Section(m_HeaderFont, "Modify", false)) {
+        Entity* sel = m_Scene.Find(m_Selected);
+        bool canModify = sel && sel->mesh && !sel->light.enabled;
+        size_t triCount = canModify ? sel->mesh->Indices().size() / 3 : 0;
+        bool tooDense = triCount * 4 > 100000; // subdivision quadruples the count
+
+        ImGui::BeginDisabled(!canModify);
+        if (ImGui::Button("Mirror X", ImVec2(-1, 30)))
+            MirrorSelected();
+        ImGui::SetItemTooltip("Bake a left-right mirrored copy across the object's own center plane");
+
+        ImGui::BeginDisabled(tooDense);
+        if (ImGui::Button("Subdivide", ImVec2(-1, 30)))
+            SubdivideSelected(m_SubdivKeepShape);
+        ImGui::SetItemTooltip("Split every triangle into four for finer detail");
+        ImGui::EndDisabled();
+        ImGui::Checkbox("Keep shape", &m_SubdivKeepShape);
+        ImGui::SetItemTooltip("On: only add resolution (for sculpting).\nOff: also smooth the surface rounder");
+        if (tooDense)
+            ImGui::TextDisabled("Too dense to subdivide (%zu tris)", triCount);
+
+        if (ImGui::Button("Remesh", ImVec2(-1, 30)))
+            RemeshSelected();
+        ImGui::SetItemTooltip("Rebuild the surface as clean, even triangles.\nFixes stretched or messy geometry before sculpting");
+        ImGui::SliderInt("Detail", &m_RemeshDetail, 32, 160);
+        ImGui::SetItemTooltip("Higher keeps more detail but makes more triangles");
+        ImGui::EndDisabled();
+        if (!canModify)
+            ImGui::TextDisabled("Select an object to modify.");
+
+        // Booleans need exactly two solid meshes.
+        bool canBool = m_Selection.size() == 2;
+        for (UUID id : m_Selection) {
+            Entity* be = m_Scene.Find(id);
+            if (!be || !be->mesh || be->light.enabled)
+                canBool = false;
+        }
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Boolean");
+        ImGui::SetItemTooltip("Combine or carve two objects (select both with Ctrl+click)");
+        ImGui::BeginDisabled(!canBool);
+        float thirdW = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+        if (ImGui::Button("Union", ImVec2(thirdW, 28)))
+            BooleanSelected(BooleanOp::Union);
+        ImGui::SetItemTooltip("Merge both objects into one solid");
+        ImGui::SameLine();
+        if (ImGui::Button("Subtract", ImVec2(thirdW, 28)))
+            BooleanSelected(BooleanOp::Subtract);
+        ImGui::SetItemTooltip("Carve the second-selected object out of the first");
+        ImGui::SameLine();
+        if (ImGui::Button("Intersect", ImVec2(thirdW, 28)))
+            BooleanSelected(BooleanOp::Intersect);
+        ImGui::SetItemTooltip("Keep only where both objects overlap");
+        ImGui::EndDisabled();
+        if (!canBool)
+            ImGui::TextDisabled("Select exactly two objects (Ctrl+click).");
+        if (!m_BoolStatus.empty())
+            ImGui::TextWrapped("%s", m_BoolStatus.c_str());
+
+        ImGui::Spacing();
+        bool armed = m_Extrude.Armed();
+        if (armed)
+            ui::PushAccentButton();
+        if (ImGui::Button(armed ? "Extrude: drag a face..." : "Extrude (push/pull)", ImVec2(-1, 30))) {
+            if (armed)
+                m_Extrude.Disarm();
+            else if (!m_Sculpt.Active())
+                m_Extrude.Arm();
+        }
+        if (armed)
+            ui::PopAccentButton();
+        ImGui::SetItemTooltip("Pull a flat face out or push it in.\nClick the button, then press and drag a face in the viewport");
     }
 
     if (Section(m_HeaderFont, "Lighting & Sky", false)) {
@@ -694,6 +1058,10 @@ void EditorApp::DrawSidebar()
         if (ImGui::SliderFloat("Camera FOV", &fov, 15.0f, 100.0f, "%.0f deg"))
             m_Camera.SetFOV(fov);
         ImGui::SetItemTooltip("Camera lens angle - wide or zoomed");
+        bool ortho = m_Camera.IsOrthographic();
+        if (ImGui::Checkbox("Orthographic", &ortho))
+            m_Camera.SetOrthographic(ortho);
+        ImGui::SetItemTooltip("Parallel projection - no perspective, like a blueprint.\nGreat with the 1/3/7 view keys");
     }
 
     if (Section(m_HeaderFont, "Ray Tracing (photoreal)", false)) {
@@ -710,10 +1078,56 @@ void EditorApp::DrawSidebar()
             if (ImGui::Checkbox("Ground plane", &ground))
                 m_PathTracer.SetGroundPlane(ground);
             ImGui::SetItemTooltip("A studio floor that catches shadows");
+
+            ImGui::Checkbox("Denoise", &m_Denoise);
+            ImGui::SetItemTooltip("Smooths the grainy noise away while the image converges");
+            if (m_Denoise) {
+                ImGui::SliderFloat("Denoise strength", &m_DenoiseStrength, 0.0f, 1.0f);
+                ImGui::SetItemTooltip("Higher = smoother but softer early on");
+            }
+
+            ImGui::SliderFloat("Aperture", &m_Aperture, 0.0f, 0.3f, "%.3f");
+            ImGui::SetItemTooltip("Camera lens size. 0 = everything sharp;\nbigger = blurrier foreground/background");
+            if (m_Aperture > 0.0f) {
+                if (m_Camera.IsOrthographic()) {
+                    ImGui::TextDisabled("Depth of field is off in orthographic view");
+                } else {
+                    if (m_FocusDist <= 0.0f)
+                        m_FocusDist = glm::length(m_Camera.FocalPoint() - m_Camera.Position());
+                    ImGui::SliderFloat("Focus distance", &m_FocusDist, 0.5f, 50.0f, "%.2f");
+                    ImGui::SetItemTooltip("Distance to the plane that stays sharp");
+                    if (ImGui::Button("Focus on selected", ImVec2(-1, 0))) {
+                        if (Entity* sel = m_Scene.Find(m_Selected))
+                            m_FocusDist = glm::length(vec3(m_Scene.WorldTransform(sel->id)[3]) -
+                                                      m_Camera.Position());
+                    }
+                    ImGui::SetItemTooltip("Set the focus distance to the selected object");
+                }
+            }
+
             ImGui::TextDisabled("%d samples, %zu triangles", m_PathTracer.SampleCount(),
                                 m_PathTracer.TriangleCount());
         }
     }
+
+    if (Section(m_HeaderFont, "Export", false)) {
+        ImGui::DragFloat("Scale (mm/unit)", &m_StlScale, 1.0f, 1.0f, 1000.0f, "%.0f");
+        ImGui::SetItemTooltip("How many millimeters one scene unit becomes when printed");
+        if (ImGui::Button("Export STL...", ImVec2(-1, 30)))
+            ExportStlDialog();
+        ImGui::SetItemTooltip("Save for 3D printing. Exports the selection,\nor the whole scene when nothing is selected");
+        if (!m_StlStatus.empty())
+            ImGui::TextWrapped("%s", m_StlStatus.c_str());
+
+        ImGui::Spacing();
+        ImGui::BeginDisabled(m_Turntable.active || m_Scene.Entities().empty());
+        if (ImGui::Button("Turntable GIF...", ImVec2(-1, 30)))
+            StartTurntableDialog();
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Render a looping 360-degree spin of your scene\n(path traced - takes a minute)");
+    }
+
+    DrawTurntableModal();
 
     ImGui::End();
 }
@@ -967,7 +1381,7 @@ void EditorApp::DrawViewport()
         m_Camera.SetViewportSize(avail.x, avail.y);
         // Sculpt mode and pending BVH rebuilds force raster rendering — show the
         // raster output too, not a stale path-traced frame.
-        bool showRT = m_RayTracing && !m_Sculpt.Active() && !m_RTUploadPending;
+        bool showRT = (m_RayTracing || m_Turntable.active) && !m_Sculpt.Active() && !m_RTUploadPending;
         uint32_t texture = showRT ? m_PathTracer.DisplayTexture() : m_DisplayTex;
         if (texture == 0)
             texture = m_Framebuffer.ColorAttachment(); // first frame before post runs
@@ -986,11 +1400,18 @@ void EditorApp::DrawViewport()
             // Mode border: unmistakable "you are sculpting" signal.
             ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
                                                 IM_COL32(240, 148, 56, 255), 0.0f, 0, 2.0f);
+        } else if (m_Extrude.Busy()) {
+            // Extrude owns the plain LMB while armed; gizmo and selection wait.
+            if (auto cmd = m_Extrude.OnViewportFrame(m_Scene, m_Camera, m_ViewportPos, m_ViewportSize,
+                                                     m_ViewportHovered))
+                m_Commands.Push(std::move(cmd));
+            ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
+                                                IM_COL32(86, 156, 214, 255), 0.0f, 0, 2.0f);
         } else {
             // --- Gizmo (manipulates the primary selection through its parent chain) ---
             Entity* sel = m_Scene.Find(m_Selected);
             if (sel) {
-                ImGuizmo::SetOrthographic(false);
+                ImGuizmo::SetOrthographic(m_Camera.IsOrthographic());
                 ImGuizmo::SetDrawlist();
                 ImGuizmo::SetRect(m_ViewportPos.x, m_ViewportPos.y, m_ViewportSize.x, m_ViewportSize.y);
 
@@ -1087,6 +1508,8 @@ void EditorApp::DrawViewport()
                          ImGuiWindowFlags_NoInputs);
         ImGui::TextDisabled(m_Sculpt.Active()
                                 ? "Drag to sculpt   Ctrl inverts   Shift smooths   Tab exits"
+                            : m_Extrude.Busy()
+                                ? "Press a flat face and drag to extrude   Esc cancels"
                                 : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select");
         ImGui::End();
     }

@@ -3,13 +3,14 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace forge {
 
 EditorCamera::EditorCamera(float fovDegrees, float nearClip, float farClip)
     : m_FOV(fovDegrees), m_Near(nearClip), m_Far(farClip)
 {
-    m_Projection = glm::perspective(glm::radians(m_FOV), m_Aspect, m_Near, m_Far);
+    RecalculateProjection();
     RecalculateView();
 }
 
@@ -18,7 +19,24 @@ void EditorCamera::SetViewportSize(float width, float height)
     if (width <= 0.0f || height <= 0.0f)
         return;
     m_Aspect = width / height;
-    m_Projection = glm::perspective(glm::radians(m_FOV), m_Aspect, m_Near, m_Far);
+    RecalculateProjection();
+}
+
+void EditorCamera::SetOrthographic(bool ortho)
+{
+    m_Orthographic = ortho;
+    RecalculateProjection();
+}
+
+void EditorCamera::RecalculateProjection()
+{
+    if (m_Orthographic) {
+        // Match the perspective framing at the focal plane so toggling doesn't jump.
+        float halfH = m_Distance * std::tan(glm::radians(m_FOV) * 0.5f);
+        m_Projection = glm::ortho(-halfH * m_Aspect, halfH * m_Aspect, -halfH, halfH, m_Near, m_Far);
+    } else {
+        m_Projection = glm::perspective(glm::radians(m_FOV), m_Aspect, m_Near, m_Far);
+    }
 }
 
 vec3 EditorCamera::Forward() const
@@ -70,12 +88,16 @@ void EditorCamera::Focus(const vec3& point, float radius)
 {
     m_FocalPoint = point;
     m_Distance = std::clamp(radius * 2.5f, 1.0f, 200.0f);
+    if (m_Orthographic) // ortho extents depend on distance
+        RecalculateProjection();
     RecalculateView();
 }
 
 void EditorCamera::Zoom(float factor)
 {
     m_Distance = std::clamp(m_Distance * factor, 0.5f, 200.0f);
+    if (m_Orthographic) // in ortho, "zoom" only works through the projection extents
+        RecalculateProjection();
     RecalculateView();
 }
 
@@ -89,7 +111,7 @@ void EditorCamera::SetOrbit(float pitch, float yaw)
 void EditorCamera::SetFOV(float degrees)
 {
     m_FOV = std::clamp(degrees, 10.0f, 120.0f);
-    m_Projection = glm::perspective(glm::radians(m_FOV), m_Aspect, m_Near, m_Far);
+    RecalculateProjection();
 }
 
 void EditorCamera::ApplyBookmark(const Bookmark& b)
@@ -98,6 +120,8 @@ void EditorCamera::ApplyBookmark(const Bookmark& b)
     m_Distance = b.distance;
     m_Pitch = b.pitch;
     m_Yaw = b.yaw;
+    if (m_Orthographic) // bookmark distance changes the ortho extents
+        RecalculateProjection();
     RecalculateView();
 }
 

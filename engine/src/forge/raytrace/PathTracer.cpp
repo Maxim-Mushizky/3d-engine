@@ -5,6 +5,9 @@
 
 #include <GL/glew.h>
 
+#include <algorithm>
+#include <cmath>
+
 namespace forge {
 
 // GPU-side layouts (std430, 16-byte aligned).
@@ -39,6 +42,8 @@ static float IntBits(int v)
 void PathTracer::Init()
 {
     m_Compute = std::make_unique<Shader>(std::string(FORGE_ASSET_DIR) + "/shaders/pathtrace.comp");
+    m_Atrous = std::make_unique<Shader>(std::string(FORGE_ASSET_DIR) + "/shaders/atrous.comp");
+    m_Resolve = std::make_unique<Shader>(std::string(FORGE_ASSET_DIR) + "/shaders/resolve.comp");
     glGenBuffers(1, &m_TriSSBO);
     glGenBuffers(1, &m_NodeSSBO);
     glGenBuffers(1, &m_MatSSBO);
@@ -53,14 +58,23 @@ void PathTracer::Resize(uint32_t width, uint32_t height)
 
     glDeleteTextures(1, &m_AccumTex);
     glDeleteTextures(1, &m_DisplayTex);
+    glDeleteTextures(1, &m_AlbedoTex);
+    glDeleteTextures(1, &m_NormalDepthTex);
+    glDeleteTextures(1, &m_PingTex);
+    glDeleteTextures(1, &m_PongTex);
 
-    glGenTextures(1, &m_AccumTex);
-    glBindTexture(GL_TEXTURE_2D, m_AccumTex);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, (GLsizei)width, (GLsizei)height);
+    auto makeTex = [&](uint32_t& tex, GLenum format) {
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexStorage2D(GL_TEXTURE_2D, 1, format, (GLsizei)width, (GLsizei)height);
+    };
+    makeTex(m_AccumTex, GL_RGBA32F);
+    makeTex(m_AlbedoTex, GL_RGBA16F);
+    makeTex(m_NormalDepthTex, GL_RGBA16F);
+    makeTex(m_PingTex, GL_RGBA16F);
+    makeTex(m_PongTex, GL_RGBA16F);
 
-    glGenTextures(1, &m_DisplayTex);
-    glBindTexture(GL_TEXTURE_2D, m_DisplayTex);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)width, (GLsizei)height);
+    makeTex(m_DisplayTex, GL_RGBA8);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -178,6 +192,10 @@ void PathTracer::Dispatch(const mat4& viewProjection, const vec3& cameraPos, con
     m_Compute->SetInt("u_SamplesPerPass", samplesPerPass);
     m_Compute->SetInt("u_MaxBounces", maxBounces);
     m_Compute->SetInt("u_NumNodes", (int)m_NodeCount);
+    m_Compute->SetFloat("u_Aperture", m_Aperture);
+    m_Compute->SetFloat("u_FocusDist", m_FocusDist);
+    m_Compute->SetVec3("u_CamRight", m_CamRight);
+    m_Compute->SetVec3("u_CamUp", m_CamUp);
     m_Compute->SetVec3("u_SunDir", glm::normalize(sun.direction));
     m_Compute->SetVec3("u_SunColor", sun.color);
     m_Compute->SetFloat("u_SunIntensity", sun.intensity);
@@ -202,16 +220,53 @@ void PathTracer::Dispatch(const mat4& viewProjection, const vec3& cameraPos, con
     }
 
     glBindImageTexture(0, m_AccumTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
-    glBindImageTexture(1, m_DisplayTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glBindImageTexture(2, m_AlbedoTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glBindImageTexture(3, m_NormalDepthTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_TriSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_NodeSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_MatSSBO);
 
-    glDispatchCompute((m_Width + 7) / 8, (m_Height + 7) / 8, 1);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    GLuint groupsX = (m_Width + 7) / 8, groupsY = (m_Height + 7) / 8;
+    glDispatchCompute(groupsX, groupsY, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     m_SampleCount += samplesPerPass;
     ++m_FrameIndex;
+
+    // --- denoise + resolve ---------------------------------------------------
+    // Past ~2048 spp the raw image is cleaner than any filter; skip the passes.
+    bool filter = m_Denoise && m_DenoiseStrength > 0.0f && m_SampleCount <= 2048;
+    uint32_t filteredTex = m_PingTex;
+    if (filter) {
+        m_Atrous->Bind();
+        m_Atrous->SetFloat("u_Spp", (float)m_SampleCount);
+        glBindImageTexture(0, m_AccumTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+        glBindImageTexture(3, m_AlbedoTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+        glBindImageTexture(4, m_NormalDepthTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+        uint32_t src = m_PongTex, dst = m_PingTex; // first pass reads accum, src is dummy
+        const int steps[4] = {1, 2, 4, 8};
+        for (int i = 0; i < 4; ++i) {
+            m_Atrous->SetInt("u_StepSize", steps[i]);
+            m_Atrous->SetInt("u_FirstPass", i == 0 ? 1 : 0);
+            glBindImageTexture(1, src, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+            glBindImageTexture(2, dst, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+            glDispatchCompute(groupsX, groupsY, 1);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            std::swap(src, dst);
+        }
+        filteredTex = src; // last written
+    }
+
+    // Blend fades as accumulation converges so fine detail comes back.
+    float strength = std::min(m_DenoiseStrength * 8.0f / std::sqrt((float)std::max(m_SampleCount, 1)), 1.0f);
+    m_Resolve->Bind();
+    m_Resolve->SetFloat("u_Strength", strength);
+    m_Resolve->SetInt("u_UseFiltered", filter ? 1 : 0);
+    glBindImageTexture(0, m_AccumTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glBindImageTexture(1, filteredTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+    glBindImageTexture(2, m_DisplayTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute(groupsX, groupsY, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
 
 } // namespace forge

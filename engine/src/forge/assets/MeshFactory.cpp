@@ -2,6 +2,9 @@
 
 #include <glm/gtc/constants.hpp>
 
+#include <algorithm>
+#include <cfloat>
+
 namespace forge {
 
 std::shared_ptr<Mesh> MeshFactory::Cube()
@@ -193,6 +196,242 @@ std::shared_ptr<Mesh> MeshFactory::Plane(float size, uint32_t subdivisions)
         }
     }
     return std::make_shared<Mesh>(std::move(vertices), std::move(indices));
+}
+
+// ---------------------------------------------------------------------------
+// Text -> extruded 3D mesh
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One closed glyph outline in font units, flattened to line segments.
+struct Contour {
+    std::vector<vec2> points;
+    float signedArea = 0.0f; // shoelace; sign gives winding
+    int depth = 0;           // how many other contours enclose it (even = outer, odd = hole)
+};
+
+float Shoelace(const std::vector<vec2>& pts)
+{
+    float a = 0.0f;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        const vec2& p = pts[i];
+        const vec2& q = pts[(i + 1) % pts.size()];
+        a += p.x * q.y - q.x * p.y;
+    }
+    return 0.5f * a;
+}
+
+bool PointInPolygon(const vec2& p, const std::vector<vec2>& poly)
+{
+    bool inside = false;
+    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+        if ((poly[i].y > p.y) != (poly[j].y > p.y) &&
+            p.x < (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)
+            inside = true;
+    }
+    return inside;
+}
+
+} // namespace
+
+} // namespace forge
+
+#define STB_TRUETYPE_IMPLEMENTATION
+#include <stb_truetype.h>
+#include <mapbox/earcut.hpp>
+
+#include <array>
+#include <fstream>
+
+namespace forge {
+
+std::shared_ptr<Mesh> MeshFactory::Text(const std::string& text, const std::string& fontPath, float depth)
+{
+    std::ifstream file(fontPath, std::ios::binary | std::ios::ate);
+    if (!file)
+        return nullptr;
+    std::vector<unsigned char> fontData((size_t)file.tellg());
+    file.seekg(0);
+    file.read((char*)fontData.data(), (std::streamsize)fontData.size());
+
+    stbtt_fontinfo font;
+    if (!stbtt_InitFont(&font, fontData.data(), stbtt_GetFontOffsetForIndex(fontData.data(), 0)))
+        return nullptr;
+
+    std::vector<Vertex> outVerts;
+    std::vector<uint32_t> outIdx;
+
+    int ascent = 0, descentI = 0, lineGap = 0;
+    stbtt_GetFontVMetrics(&font, &ascent, &descentI, &lineGap);
+    const float fontHeight = (float)ascent; // cap height-ish; normalized at the end
+    float penX = 0.0f;
+    constexpr int kBezierSegments = 10;
+
+    int prevCp = 0;
+    for (unsigned char ch : text) {
+        int cp = (int)ch; // ASCII/Latin-1 only — fine for a beginner nameplate tool
+        if (prevCp)
+            penX += (float)stbtt_GetCodepointKernAdvance(&font, prevCp, cp);
+        prevCp = cp;
+
+        int advance = 0, lsb = 0;
+        stbtt_GetCodepointHMetrics(&font, cp, &advance, &lsb);
+
+        stbtt_vertex* shape = nullptr;
+        int numShape = stbtt_GetCodepointShape(&font, cp, &shape);
+        if (numShape <= 0 || !shape) {
+            penX += (float)advance;
+            continue;
+        }
+
+        // --- flatten outlines to contours -----------------------------------
+        std::vector<Contour> contours;
+        Contour cur;
+        vec2 pos{0.0f};
+        bool sawCubic = false;
+        auto closeContour = [&]() {
+            if (cur.points.size() >= 3) {
+                if (glm::distance(cur.points.front(), cur.points.back()) < 1e-3f)
+                    cur.points.pop_back(); // drop duplicated closing point
+                if (cur.points.size() >= 3) {
+                    cur.signedArea = Shoelace(cur.points);
+                    contours.push_back(std::move(cur));
+                }
+            }
+            cur = {};
+        };
+        for (int s = 0; s < numShape; ++s) {
+            const stbtt_vertex& v = shape[s];
+            vec2 p{(float)v.x + penX, (float)v.y};
+            switch (v.type) {
+            case STBTT_vmove:
+                closeContour();
+                cur.points.push_back(p);
+                pos = p;
+                break;
+            case STBTT_vline:
+                cur.points.push_back(p);
+                pos = p;
+                break;
+            case STBTT_vcurve: {
+                vec2 c{(float)v.cx + penX, (float)v.cy};
+                for (int k = 1; k <= kBezierSegments; ++k) {
+                    float t = (float)k / kBezierSegments;
+                    float u = 1.0f - t;
+                    cur.points.push_back(pos * (u * u) + c * (2.0f * u * t) + p * (t * t));
+                }
+                pos = p;
+                break;
+            }
+            default: // STBTT_vcubic: CFF outlines unsupported
+                sawCubic = true;
+                break;
+            }
+        }
+        closeContour();
+        stbtt_FreeShape(&font, shape);
+        penX += (float)advance;
+        if (sawCubic)
+            return nullptr; // reject CFF fonts wholesale rather than emit garbage
+
+        // --- classify outer vs hole by containment depth (winding untrusted) --
+        for (size_t i = 0; i < contours.size(); ++i)
+            for (size_t j = 0; j < contours.size(); ++j)
+                if (i != j && PointInPolygon(contours[i].points[0], contours[j].points))
+                    ++contours[i].depth;
+
+        // Force orientation: outers CCW, holes CW (walls below rely on it).
+        for (Contour& c : contours) {
+            bool isHole = (c.depth % 2) == 1;
+            bool ccw = c.signedArea > 0.0f;
+            if (isHole == ccw)
+                std::reverse(c.points.begin(), c.points.end());
+        }
+
+        // --- per outer: earcut caps + wall strips -----------------------------
+        const float zF = depth * 0.5f * fontHeight, zB = -zF; // scaled with font units, normalized later
+        for (size_t i = 0; i < contours.size(); ++i) {
+            if (contours[i].depth % 2)
+                continue; // holes are emitted with their outer
+
+            using EPoint = std::array<float, 2>;
+            std::vector<std::vector<EPoint>> polygon;
+            std::vector<const Contour*> rings{&contours[i]};
+            // A hole belongs to this outer iff it sits inside it one level deeper.
+            for (size_t j = 0; j < contours.size(); ++j)
+                if (j != i && contours[j].depth == contours[i].depth + 1 &&
+                    PointInPolygon(contours[j].points[0], contours[i].points))
+                    rings.push_back(&contours[j]);
+            for (const Contour* r : rings) {
+                std::vector<EPoint> ring;
+                ring.reserve(r->points.size());
+                for (const vec2& p : r->points)
+                    ring.push_back({p.x, p.y});
+                polygon.push_back(std::move(ring));
+            }
+
+            std::vector<uint32_t> capIdx = mapbox::earcut<uint32_t>(polygon);
+            if (capIdx.empty())
+                continue;
+
+            // Front cap verts (rings flattened, matching earcut's index space).
+            uint32_t frontBase = (uint32_t)outVerts.size();
+            for (const Contour* r : rings)
+                for (const vec2& p : r->points)
+                    outVerts.push_back({{p.x, p.y, zF}, {0, 0, 1}, {0, 0}});
+            uint32_t backBase = (uint32_t)outVerts.size();
+            for (const Contour* r : rings)
+                for (const vec2& p : r->points)
+                    outVerts.push_back({{p.x, p.y, zB}, {0, 0, -1}, {0, 0}});
+
+            // earcut output follows the outer ring's CCW orientation -> +z facing.
+            for (size_t k = 0; k + 2 < capIdx.size(); k += 3) {
+                outIdx.insert(outIdx.end(),
+                              {frontBase + capIdx[k], frontBase + capIdx[k + 1], frontBase + capIdx[k + 2]});
+                outIdx.insert(outIdx.end(),
+                              {backBase + capIdx[k + 2], backBase + capIdx[k + 1], backBase + capIdx[k]});
+            }
+
+            // Walls: fresh vertices per edge for hard side edges.
+            for (const Contour* r : rings) {
+                const auto& pts = r->points;
+                for (size_t k = 0; k < pts.size(); ++k) {
+                    const vec2& a = pts[k];
+                    const vec2& b = pts[(k + 1) % pts.size()];
+                    vec2 dir = b - a;
+                    float len = glm::length(dir);
+                    if (len < 1e-6f)
+                        continue;
+                    vec2 nrm2{dir.y / len, -dir.x / len}; // right of travel = outward for CCW outer
+                    vec3 n{nrm2.x, nrm2.y, 0.0f};
+                    uint32_t base = (uint32_t)outVerts.size();
+                    outVerts.push_back({{a.x, a.y, zF}, n, {0, 0}});
+                    outVerts.push_back({{b.x, b.y, zF}, n, {0, 0}});
+                    outVerts.push_back({{a.x, a.y, zB}, n, {0, 0}});
+                    outVerts.push_back({{b.x, b.y, zB}, n, {0, 0}});
+                    // (A, A', B') + (A, B', B): outward for the orientation forced above
+                    outIdx.insert(outIdx.end(), {base, base + 2, base + 3, base, base + 3, base + 1});
+                }
+            }
+        }
+    }
+
+    if (outIdx.empty())
+        return nullptr;
+
+    // Normalize: glyph height ~1 unit, centered at origin.
+    vec3 mn(FLT_MAX), mx(-FLT_MAX);
+    for (const Vertex& v : outVerts) {
+        mn = glm::min(mn, v.position);
+        mx = glm::max(mx, v.position);
+    }
+    float s = 1.0f / fontHeight;
+    vec3 center = (mn + mx) * 0.5f;
+    for (Vertex& v : outVerts)
+        v.position = (v.position - center) * s;
+
+    return std::make_shared<Mesh>(std::move(outVerts), std::move(outIdx));
 }
 
 } // namespace forge

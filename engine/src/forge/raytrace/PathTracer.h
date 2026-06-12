@@ -24,6 +24,25 @@ public:
     void SetGroundPlane(bool enabled) { m_GroundPlane = enabled; }
     bool GroundPlane() const { return m_GroundPlane; }
 
+    // Thin-lens depth of field. aperture 0 = pinhole (off). right/up are the
+    // camera basis vectors (the lens disc lies in the camera plane).
+    void SetLens(float aperture, float focusDistance, const vec3& right, const vec3& up)
+    {
+        m_Aperture = aperture;
+        m_FocusDist = focusDistance;
+        m_CamRight = right;
+        m_CamUp = up;
+    }
+
+    // À-trous wavelet denoiser. strength 0..1; the effective blend fades as
+    // samples converge (k/sqrt(spp) curve) so detail returns over time.
+    void SetDenoise(bool enabled, float strength)
+    {
+        m_Denoise = enabled;
+        m_DenoiseStrength = strength;
+    }
+    bool Denoise() const { return m_Denoise; }
+
     // Flatten the scene: world-space triangles + BVH + materials into SSBOs.
     void Upload(const Scene& scene);
 
@@ -32,17 +51,25 @@ public:
                   const std::vector<PointLightDraw>& pointLights, const Environment* env, int samplesPerPass = 1);
 
     uint32_t DisplayTexture() const { return m_DisplayTex; }
+    uint32_t Width() const { return m_Width; }
+    uint32_t Height() const { return m_Height; }
     int SampleCount() const { return m_SampleCount; }
     size_t TriangleCount() const { return m_TriCount; }
 
 private:
-    std::unique_ptr<Shader> m_Compute;
+    std::unique_ptr<Shader> m_Compute, m_Atrous, m_Resolve;
     uint32_t m_AccumTex = 0, m_DisplayTex = 0;
+    uint32_t m_AlbedoTex = 0, m_NormalDepthTex = 0; // denoiser guides (first hit)
+    uint32_t m_PingTex = 0, m_PongTex = 0;          // à-trous ping-pong
     uint32_t m_TriSSBO = 0, m_NodeSSBO = 0, m_MatSSBO = 0;
     uint32_t m_Width = 0, m_Height = 0;
     int m_SampleCount = 0;
     int m_FrameIndex = 0; // never resets: decorrelates noise across accumulation restarts
     bool m_GroundPlane = true;
+    float m_Aperture = 0.0f, m_FocusDist = 8.0f;
+    vec3 m_CamRight{1.0f, 0.0f, 0.0f}, m_CamUp{0.0f, 1.0f, 0.0f};
+    bool m_Denoise = true;
+    float m_DenoiseStrength = 0.7f;
     size_t m_TriCount = 0;
     size_t m_NodeCount = 0;
 };

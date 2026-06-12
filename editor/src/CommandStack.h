@@ -82,6 +82,30 @@ private:
     std::vector<Vertex> m_Before, m_After;
 };
 
+// Topology ops (mirror, subdivide, boolean, extrude) replace the whole mesh.
+// O(1): the COW discipline means nobody mutates a mesh that undo history holds,
+// so keeping both shared_ptrs is safe and cheap.
+class MeshSwapCommand : public Command {
+public:
+    MeshSwapCommand(UUID entity, std::shared_ptr<Mesh> before, std::shared_ptr<Mesh> after)
+        : m_Entity(entity), m_Before(std::move(before)), m_After(std::move(after))
+    {
+    }
+
+    void Undo(Scene& scene) override { Apply(scene, m_Before); }
+    void Redo(Scene& scene) override { Apply(scene, m_After); }
+
+private:
+    void Apply(Scene& scene, const std::shared_ptr<Mesh>& mesh)
+    {
+        if (Entity* e = scene.Find(m_Entity))
+            e->mesh = mesh;
+    }
+
+    UUID m_Entity;
+    std::shared_ptr<Mesh> m_Before, m_After;
+};
+
 // Groups several commands into one undo step (e.g. multi-part model import).
 class CompositeCommand : public Command {
 public:

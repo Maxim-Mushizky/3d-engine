@@ -22,6 +22,10 @@ public:
     void SetFOV(float degrees);
     float FOV() const { return m_FOV; }
 
+    // Ortho extents derive from distance * FOV so toggling keeps the framing.
+    void SetOrthographic(bool ortho);
+    bool IsOrthographic() const { return m_Orthographic; }
+
     struct Bookmark {
         vec3 focalPoint;
         float distance, pitch, yaw;
@@ -37,12 +41,14 @@ public:
 
 private:
     void RecalculateView();
+    void RecalculateProjection();
     vec3 Forward() const;
     vec3 Right() const;
     vec3 Up() const;
 
     float m_FOV, m_Near, m_Far;
     float m_Aspect = 16.0f / 9.0f;
+    bool m_Orthographic = false;
 
     vec3 m_FocalPoint{0.0f, 0.5f, 0.0f};
     float m_Distance = 8.0f;

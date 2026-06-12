@@ -27,4 +27,22 @@ std::string OpenFileDialog(GLFWwindow* owner, const char* filter)
     return fileName;
 }
 
+std::string SaveFileDialog(GLFWwindow* owner, const char* filter, const char* defaultExt)
+{
+    char fileName[MAX_PATH] = {0};
+
+    OPENFILENAMEA ofn = {0};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner ? glfwGetWin32Window(owner) : nullptr;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = defaultExt;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (GetSaveFileNameA(&ofn) != TRUE)
+        return {};
+    return fileName;
+}
+
 } // namespace forge
