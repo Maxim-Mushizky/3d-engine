@@ -177,8 +177,16 @@ void EditorApp::RenderScene()
         // Light gizmo meshes don't cast shadows (a light casting its own shadow looks broken).
         m_Renderer.Submit(*e.mesh, world, e.material, !e.light.enabled);
     }
-    if (Entity* sel = m_Scene.Find(m_Selected); sel && sel->mesh && !m_Sculpt.Active())
-        m_Renderer.SetOutline(*sel->mesh, m_Scene.WorldTransform(sel->id));
+    // Every selected entity gets an outline (primary brighter); selecting a
+    // group highlights its whole subtree, since the group node has no mesh.
+    if (!m_Sculpt.Active()) {
+        for (UUID id : m_Selection) {
+            vec3 color = id == m_Selected ? vec3(1.0f, 0.6f, 0.1f) : vec3(0.95f, 0.78f, 0.4f);
+            for (UUID node : SubtreeOf(id))
+                if (Entity* e = m_Scene.Find(node); e && e->mesh)
+                    m_Renderer.AddOutline(*e->mesh, m_Scene.WorldTransform(node), color);
+        }
+    }
     m_Renderer.EndScene(m_Framebuffer); // shadow pass + main pass
     m_Framebuffer.Unbind();
 
