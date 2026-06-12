@@ -1,0 +1,68 @@
+name: CI
+
+# Build must pass before tests run; any test failure fails the workflow, which
+# blocks the PR when these checks are marked "required" in branch protection.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (MinGW / OpenGL 4.6)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MinGW toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Configure
+        run: cmake --preset mingw-release
+
+      - name: Build
+        run: cmake --build --preset mingw-release
+
+  test:
+    name: Unit tests
+    needs: build            # build is the prerequisite stage
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MinGW toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Configure (tests enabled)
+        run: cmake --preset mingw-release -DFORGE_BUILD_TESTS=ON
+
+      # The test target links only glm (header-only), so this is fast and needs
+      # no GL context — it does not rebuild the full engine.
+      - name: Build tests
+        run: cmake --build --preset mingw-release --target forge_tests
+
+      - name: Run tests
+        run: ctest --test-dir build/release --output-on-failure

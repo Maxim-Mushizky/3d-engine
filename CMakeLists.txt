@@ -9,3 +9,9 @@ include(cmake/Dependencies.cmake)
 
 add_subdirectory(engine)
 add_subdirectory(editor)
+
+option(FORGE_BUILD_TESTS "Build the unit test suite" OFF)
+if(FORGE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

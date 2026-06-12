@@ -13,6 +13,7 @@
 
 *Forge primitives. Import worlds. Trace light.*
 
+[![CI](https://github.com/Maxim-Mushizky/forge-3d-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Maxim-Mushizky/forge-3d-engine/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg?style=flat-square)](LICENSE)
 [![Language: C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg?style=flat-square&logo=cplusplus)](https://en.cppreference.com/w/cpp/20)
 [![Graphics: OpenGL 4.6](https://img.shields.io/badge/OpenGL-4.6-5586A4.svg?style=flat-square&logo=opengl)](https://www.opengl.org/)
