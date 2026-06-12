@@ -1,5 +1,6 @@
 #include "EditorApp.h"
 
+#include <cctype>
 #include <cstring>
 #include <string>
 

@@ -173,6 +173,21 @@ void RunSceneFormatTests()
         CHECK(!DecodeScene(bytes.data(), bytes.size()).has_value());
     }
 
+    // --- overflow attack: vertexCount near 2^64 must not wrap the byte sum ----
+    {
+        std::string json = R"({"version":1,"entities":[],"meshes":[)"
+                           R"({"vertexCount":576460752303423488,"indexCount":4,"offset":0}]})";
+        std::vector<uint8_t> bytes;
+        const char magic[8] = {'F', 'O', 'R', 'G', 'E', 'S', 'C', 'N'};
+        bytes.insert(bytes.end(), magic, magic + 8);
+        uint32_t version = 1, len = (uint32_t)json.size();
+        bytes.insert(bytes.end(), (uint8_t*)&version, (uint8_t*)&version + 4);
+        bytes.insert(bytes.end(), (uint8_t*)&len, (uint8_t*)&len + 4);
+        bytes.insert(bytes.end(), json.begin(), json.end());
+        bytes.resize(bytes.size() + 64, 0);
+        CHECK(!DecodeScene(bytes.data(), bytes.size()).has_value());
+    }
+
     // --- forward compatibility: unknown keys ignored, defaults applied --------
     {
         std::string json = R"({"version":1,"futureFeature":{"x":1},)"

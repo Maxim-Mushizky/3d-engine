@@ -40,6 +40,8 @@ T GetOr(const json& j, const char* key, T fallback)
 
 void Append(std::vector<uint8_t>& out, const void* data, size_t bytes)
 {
+    if (bytes == 0)
+        return; // empty vectors may hand out a null data() — don't form pointers from it
     const uint8_t* p = (const uint8_t*)data;
     out.insert(out.end(), p, p + bytes);
 }
@@ -148,14 +150,20 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                 uint64_t vCount = GetOr<uint64_t>(jm, "vertexCount", 0);
                 uint64_t iCount = GetOr<uint64_t>(jm, "indexCount", 0);
                 uint64_t offset = GetOr<uint64_t>(jm, "offset", 0);
+                // Per-count division checks first: a hostile vCount near 2^64
+                // would overflow the byte sum and sneak past a single check.
+                if (vCount > blobSize / sizeof(Vertex) || iCount > blobSize / sizeof(uint32_t))
+                    return std::nullopt;
                 uint64_t bytes = vCount * sizeof(Vertex) + iCount * sizeof(uint32_t);
                 if (offset > blobSize || bytes > blobSize - offset)
                     return std::nullopt; // truncated or hostile blob reference
                 m.vertices.resize(vCount);
                 m.indices.resize(iCount);
-                std::memcpy(m.vertices.data(), blob + offset, vCount * sizeof(Vertex));
-                std::memcpy(m.indices.data(), blob + offset + vCount * sizeof(Vertex),
-                            iCount * sizeof(uint32_t));
+                if (vCount)
+                    std::memcpy(m.vertices.data(), blob + offset, vCount * sizeof(Vertex));
+                if (iCount)
+                    std::memcpy(m.indices.data(), blob + offset + vCount * sizeof(Vertex),
+                                iCount * sizeof(uint32_t));
             }
             scene.meshes.push_back(std::move(m));
         }

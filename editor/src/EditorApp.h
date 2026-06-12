@@ -83,8 +83,12 @@ private:
     bool SaveSceneAs();
     void RequestWithUnsavedCheck(FileAction action, const std::string& openPath = "");
     void ExecutePendingAction();
-    bool SceneDirty() const { return m_Commands.Revision() != m_SavedRevision; }
-    void MarkSaved() { m_SavedRevision = m_Commands.Revision(); }
+    // Dirty = entity edits (command revision) OR scene-level settings changes
+    // (sun/sky/RT/export — hashed). Camera pose is deliberately excluded:
+    // orbiting around your model isn't unsaved work.
+    bool SceneDirty() const;
+    void MarkSaved();
+    uint64_t SettingsHash() const;
     void UpdateWindowTitle();
     std::string BuildExtrasJson() const;
     void ApplyExtrasJson(const std::string& extras);
@@ -148,7 +152,8 @@ private:
 
     std::string m_ScenePath;        // empty = untitled
     std::string m_EnvPath;          // HDRI source path (for serialization)
-    uint64_t m_SavedRevision = 0;   // CommandStack revision at last save
+    uint64_t m_SavedRevision = 0;     // CommandStack revision at last save
+    uint64_t m_SavedSettingsHash = 0; // SettingsHash() at last save
     std::vector<std::string> m_RecentFiles;
     FileAction m_PendingAction = FileAction::None;
     std::string m_PendingOpenPath;

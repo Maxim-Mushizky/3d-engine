@@ -530,6 +530,39 @@ std::string EditorApp::BuildExtrasJson() const
     return j.dump();
 }
 
+// Type-checked json getters: scene files are hand-editable by design, so a
+// string where a number belongs must skip the field, never throw.
+namespace {
+float NumOr(const nlohmann::json& o, const char* key, float fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_number() ? it->get<float>() : fallback;
+}
+int IntOr(const nlohmann::json& o, const char* key, int fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_number_integer() ? it->get<int>() : fallback;
+}
+bool BoolOr(const nlohmann::json& o, const char* key, bool fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_boolean() ? it->get<bool>() : fallback;
+}
+std::string StrOr(const nlohmann::json& o, const char* key, const std::string& fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+vec3 Vec3Or(const nlohmann::json& o, const char* key, const vec3& fallback)
+{
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_array() || it->size() != 3 || !(*it)[0].is_number() ||
+        !(*it)[1].is_number() || !(*it)[2].is_number())
+        return fallback;
+    return {(*it)[0].get<float>(), (*it)[1].get<float>(), (*it)[2].get<float>()};
+}
+} // namespace
+
 void EditorApp::ApplyExtrasJson(const std::string& extras)
 {
     using nlohmann::json;
@@ -537,47 +570,44 @@ void EditorApp::ApplyExtrasJson(const std::string& extras)
     if (j.is_discarded() || !j.is_object())
         return; // old or hand-edited file without extras: keep current settings
 
-    auto vec3At = [](const json& a, vec3 fallback) {
-        if (!a.is_array() || a.size() != 3)
-            return fallback;
-        return vec3(a[0].get<float>(), a[1].get<float>(), a[2].get<float>());
-    };
-
     if (auto s = j.find("sun"); s != j.end() && s->is_object()) {
-        m_SunAzimuth = s->value("azimuth", m_SunAzimuth);
-        m_SunElevation = s->value("elevation", m_SunElevation);
-        m_Sun.intensity = s->value("intensity", m_Sun.intensity);
-        m_Sun.color = vec3At(s->value("color", json()), m_Sun.color);
+        m_SunAzimuth = NumOr(*s, "azimuth", m_SunAzimuth);
+        m_SunElevation = NumOr(*s, "elevation", m_SunElevation);
+        m_Sun.intensity = NumOr(*s, "intensity", m_Sun.intensity);
+        m_Sun.color = Vec3Or(*s, "color", m_Sun.color);
     }
     if (auto s = j.find("sky"); s != j.end() && s->is_object()) {
-        std::string hdri = s->value("hdri", std::string());
+        std::string hdri = StrOr(*s, "hdri", "");
         if (hdri.empty()) {
             m_Env.reset();
             m_EnvPath.clear();
         } else if (LoadHDRIFile(hdri)) {
-            m_Env->intensity = s->value("intensity", 1.0f);
-            m_Env->rotationDegrees = s->value("rotation", 0.0f);
+            m_Env->intensity = NumOr(*s, "intensity", 1.0f);
+            m_Env->rotationDegrees = NumOr(*s, "rotation", 0.0f);
         } else {
+            // The loaded scene must not inherit whatever sky was up before.
+            m_Env.reset();
+            m_EnvPath.clear();
             FORGE_WARN("Scene references a missing HDRI: %s", hdri.c_str());
         }
     }
     if (auto s = j.find("rt"); s != j.end() && s->is_object()) {
-        m_RayTracing = s->value("enabled", m_RayTracing);
-        m_Bounces = s->value("bounces", m_Bounces);
-        m_RTScale = s->value("scale", m_RTScale);
-        m_Denoise = s->value("denoise", m_Denoise);
-        m_DenoiseStrength = s->value("denoiseStrength", m_DenoiseStrength);
-        m_Aperture = s->value("aperture", m_Aperture);
-        m_FocusDist = s->value("focus", m_FocusDist);
-        m_PathTracer.SetGroundPlane(s->value("ground", m_PathTracer.GroundPlane()));
+        m_RayTracing = BoolOr(*s, "enabled", m_RayTracing);
+        m_Bounces = IntOr(*s, "bounces", m_Bounces);
+        m_RTScale = NumOr(*s, "scale", m_RTScale);
+        m_Denoise = BoolOr(*s, "denoise", m_Denoise);
+        m_DenoiseStrength = NumOr(*s, "denoiseStrength", m_DenoiseStrength);
+        m_Aperture = NumOr(*s, "aperture", m_Aperture);
+        m_FocusDist = NumOr(*s, "focus", m_FocusDist);
+        m_PathTracer.SetGroundPlane(BoolOr(*s, "ground", m_PathTracer.GroundPlane()));
     }
     if (auto s = j.find("camera"); s != j.end() && s->is_object()) {
         EditorCamera::Bookmark cam;
-        cam.focalPoint = vec3At(s->value("focal", json()), {0.0f, 0.5f, 0.0f});
-        cam.distance = s->value("distance", 8.0f);
-        cam.pitch = s->value("pitch", 0.45f);
-        cam.yaw = s->value("yaw", 0.65f);
-        m_Camera.SetOrthographic(s->value("ortho", false));
+        cam.focalPoint = Vec3Or(*s, "focal", {0.0f, 0.5f, 0.0f});
+        cam.distance = NumOr(*s, "distance", 8.0f);
+        cam.pitch = NumOr(*s, "pitch", 0.45f);
+        cam.yaw = NumOr(*s, "yaw", 0.65f);
+        m_Camera.SetOrthographic(BoolOr(*s, "ortho", false));
         m_Camera.ApplyBookmark(cam);
     }
     if (auto s = j.find("bookmarks"); s != j.end() && s->is_array()) {
@@ -586,14 +616,58 @@ void EditorApp::ApplyExtrasJson(const std::string& extras)
             m_Bookmarks[i].set = b.is_object();
             if (!m_Bookmarks[i].set)
                 continue;
-            m_Bookmarks[i].value.focalPoint = vec3At(b.value("focal", json()), vec3(0.0f));
-            m_Bookmarks[i].value.distance = b.value("distance", 8.0f);
-            m_Bookmarks[i].value.pitch = b.value("pitch", 0.0f);
-            m_Bookmarks[i].value.yaw = b.value("yaw", 0.0f);
+            m_Bookmarks[i].value.focalPoint = Vec3Or(b, "focal", vec3(0.0f));
+            m_Bookmarks[i].value.distance = NumOr(b, "distance", 8.0f);
+            m_Bookmarks[i].value.pitch = NumOr(b, "pitch", 0.0f);
+            m_Bookmarks[i].value.yaw = NumOr(b, "yaw", 0.0f);
         }
     }
-    m_SpawnCounter = j.value("spawnCounter", m_SpawnCounter);
-    m_StlScale = j.value("stlScale", m_StlScale);
+    m_SpawnCounter = IntOr(j, "spawnCounter", m_SpawnCounter);
+    m_StlScale = NumOr(j, "stlScale", m_StlScale);
+}
+
+uint64_t EditorApp::SettingsHash() const
+{
+    // FNV-1a over the scene-level settings BuildExtrasJson serializes, except
+    // camera pose/bookmarks (view changes shouldn't flag unsaved work).
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void* data, size_t bytes) {
+        const uint8_t* p = (const uint8_t*)data;
+        for (size_t i = 0; i < bytes; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(&m_SunAzimuth, sizeof(m_SunAzimuth));
+    mix(&m_SunElevation, sizeof(m_SunElevation));
+    mix(&m_Sun.intensity, sizeof(m_Sun.intensity));
+    mix(&m_Sun.color, sizeof(m_Sun.color));
+    mix(m_EnvPath.data(), m_EnvPath.size());
+    float envIntensity = m_Env ? m_Env->intensity : 0.0f;
+    float envRotation = m_Env ? m_Env->rotationDegrees : 0.0f;
+    mix(&envIntensity, sizeof(envIntensity));
+    mix(&envRotation, sizeof(envRotation));
+    mix(&m_RayTracing, sizeof(m_RayTracing));
+    mix(&m_Bounces, sizeof(m_Bounces));
+    mix(&m_RTScale, sizeof(m_RTScale));
+    mix(&m_Denoise, sizeof(m_Denoise));
+    mix(&m_DenoiseStrength, sizeof(m_DenoiseStrength));
+    mix(&m_Aperture, sizeof(m_Aperture));
+    bool ground = m_PathTracer.GroundPlane();
+    mix(&ground, sizeof(ground));
+    mix(&m_StlScale, sizeof(m_StlScale));
+    return h;
+}
+
+bool EditorApp::SceneDirty() const
+{
+    return m_Commands.Revision() != m_SavedRevision || SettingsHash() != m_SavedSettingsHash;
+}
+
+void EditorApp::MarkSaved()
+{
+    m_SavedRevision = m_Commands.Revision();
+    m_SavedSettingsHash = SettingsHash();
 }
 
 void EditorApp::DoNewScene()
@@ -605,6 +679,29 @@ void EditorApp::DoNewScene()
     SelectOnly(0);
     m_Commands.Clear();
     m_ScenePath.clear();
+
+    // A new scene must not inherit the previous scene's environment/settings —
+    // reset everything BuildExtrasJson serializes.
+    m_Env.reset();
+    m_EnvPath.clear();
+    m_Sun = DirectionalLight{};
+    m_SunAzimuth = 40.0f;
+    m_SunElevation = 50.0f;
+    m_RayTracing = false;
+    m_Bounces = 4;
+    m_RTScale = 0.75f;
+    m_Denoise = true;
+    m_DenoiseStrength = 0.7f;
+    m_Aperture = 0.0f;
+    m_FocusDist = -1.0f;
+    m_PathTracer.SetGroundPlane(true);
+    for (CameraBookmark& b : m_Bookmarks)
+        b.set = false;
+    m_Camera.SetOrthographic(false);
+    m_Camera.ApplyBookmark({{0.0f, 0.5f, 0.0f}, 8.0f, 0.45f, 0.65f});
+    m_SpawnCounter = 1;
+    m_StlScale = 100.0f;
+
     MarkSaved();
     m_LastSceneHash = 0; // force RT re-upload
 }
@@ -649,8 +746,13 @@ bool EditorApp::SaveSceneAs()
     std::string path = SaveFileDialog(m_Window.NativeHandle(), "Forge Scene\0*.forge\0", "forge");
     if (path.empty())
         return false;
+    std::string previous = m_ScenePath; // only adopt the new path once the write lands
     m_ScenePath = path;
-    return SaveScene();
+    if (!SaveScene()) {
+        m_ScenePath = previous;
+        return false;
+    }
+    return true;
 }
 
 void EditorApp::RequestWithUnsavedCheck(FileAction action, const std::string& openPath)
