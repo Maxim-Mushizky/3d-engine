@@ -1,4 +1,27 @@
-# Forge — A Simple 3D Engine & Editor
+<div align="center">
+
+<pre>
+███████╗ ██████╗ ██████╗  ██████╗ ███████╗
+██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝
+█████╗  ██║   ██║██████╔╝██║  ███╗█████╗
+██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝
+██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗
+╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+</pre>
+
+### **A Simple 3D Engine & Editor**
+
+*Forge primitives. Import worlds. Trace light.*
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg?style=flat-square)](LICENSE)
+[![Language: C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg?style=flat-square&logo=cplusplus)](https://en.cppreference.com/w/cpp/20)
+[![Graphics: OpenGL 4.6](https://img.shields.io/badge/OpenGL-4.6-5586A4.svg?style=flat-square&logo=opengl)](https://www.opengl.org/)
+[![Platform: Windows 11](https://img.shields.io/badge/Platform-Windows%2011-0078D6.svg?style=flat-square&logo=windows)](#build--run)
+[![Build: CMake](https://img.shields.io/badge/Build-CMake%20%2B%20Ninja-064F8C.svg?style=flat-square&logo=cmake)](CMakeLists.txt)
+
+</div>
+
+---
 
 Forge is a small but real-time 3D engine with an integrated editor, written in modern
 C++20 on top of OpenGL 4.6. It can place primitives, import free glTF/OBJ assets, edit a
