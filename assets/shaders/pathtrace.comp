@@ -158,19 +158,62 @@ bool traverse(vec3 ro, vec3 rd, inout Hit h)
     return anyHit;
 }
 
-bool occluded(vec3 ro, vec3 rd)
+// Occlusion-only triangle test: no normal fetch, no hit record — shadow rays
+// only need a yes/no inside (epsilon, tMax).
+bool triHit(int i, vec3 ro, vec3 rd, float tMax)
 {
-    Hit h;
-    h.t = 1e30;
-    return traverse(ro, rd, h);
+    vec3 v0 = b_Tris[i * 6 + 0].xyz;
+    vec3 e1 = b_Tris[i * 6 + 1].xyz - v0;
+    vec3 e2 = b_Tris[i * 6 + 2].xyz - v0;
+    vec3 p = cross(rd, e2);
+    float det = dot(e1, p);
+    if (abs(det) < 1e-8)
+        return false;
+    float inv = 1.0 / det;
+    vec3 tv = ro - v0;
+    float u = dot(tv, p) * inv;
+    if (u < 0.0 || u > 1.0)
+        return false;
+    vec3 q = cross(tv, e1);
+    float v = dot(rd, q) * inv;
+    if (v < 0.0 || u + v > 1.0)
+        return false;
+    float t = dot(e2, q) * inv;
+    return t > 1e-4 && t < tMax;
 }
 
+// Any-hit traversal: returns on the first intersection instead of walking the
+// whole tree for the closest one. Shadow rays dominate the per-bounce ray
+// budget (sun + every point light), so the early exit pays for itself.
 bool occludedRange(vec3 ro, vec3 rd, float tMax)
 {
-    Hit h;
-    h.t = tMax; // traversal rejects hits beyond h.t
-    return traverse(ro, rd, h);
+    if (u_NumNodes == 0)
+        return false;
+    vec3 invD = 1.0 / rd;
+    int stack[32];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        int ni = stack[--sp];
+        vec4 a = b_Nodes[ni * 2 + 0];
+        vec4 b = b_Nodes[ni * 2 + 1];
+        if (!boxHit(a.xyz, b.xyz, ro, invD, tMax))
+            continue;
+        int leftFirst = floatBitsToInt(a.w);
+        int count = floatBitsToInt(b.w);
+        if (count > 0) {
+            for (int i = 0; i < count; ++i)
+                if (triHit(leftFirst + i, ro, rd, tMax))
+                    return true;
+        } else if (sp + 2 <= 32) {
+            stack[sp++] = leftFirst;
+            stack[sp++] = leftFirst + 1;
+        }
+    }
+    return false;
 }
+
+bool occluded(vec3 ro, vec3 rd) { return occludedRange(ro, rd, 1e30); }
 
 // ---------------------------------------------------------------------------
 // Environment. envLod: camera/mirror rays sample sharp (0); diffuse bounces
