@@ -9,8 +9,10 @@ add_executable(forge_tests
     test_uuid.cpp
     test_sceneformat.cpp
     test_boxselect.cpp
+    test_droptoground.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
-    ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/BoxSelect.cpp)
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/BoxSelect.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/DropToGround.cpp)
 
 target_include_directories(forge_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/src
