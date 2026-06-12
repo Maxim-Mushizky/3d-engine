@@ -60,14 +60,44 @@ uint pcg(inout uint state)
 }
 float rand(inout uint seed) { return float(pcg(seed)) / 4294967296.0; }
 
-vec3 cosineSample(vec3 n, inout uint seed)
+// R2 additive low-discrepancy sequence (plastic-constant fractions) with a
+// per-pixel Cranley-Patterson rotation: neighbouring pixels stay decorrelated
+// while each pixel's own sequence is low-discrepancy — up to O(N^-1.5)
+// convergence on smooth integrands vs O(N^-0.5) for white noise. Used only
+// for the high-impact dimensions (AA jitter, lens, first-bounce lobe and
+// direction); deeper bounces keep PCG white noise, where correlation
+// artifacts would outweigh the stratification win.
+vec2 r2(uint n, vec2 offset)
 {
-    float r1 = rand(seed), r2 = rand(seed);
+    return fract(offset + float(n) * vec2(0.75487767, 0.56984029));
+}
+
+// Distinct rotation per (pixel, purpose) — sharing one would correlate AA
+// jitter with bounce directions and print structured artifacts.
+vec2 cpRotation(uint pixelHash, uint purpose)
+{
+    uint s = pixelHash ^ (purpose * 0xC2B2AE3Du);
+    return vec2(float(pcg(s)), float(pcg(s))) / 4294967296.0;
+}
+
+// First-bounce sample values, set per sub-sample in main(). The lobes are
+// mutually exclusive, so one 2D direction dimension serves whichever is taken.
+vec2 g_LdDir;
+float g_LdLobe;
+
+vec3 cosineSampleRn(vec3 n, float r1, float r2v)
+{
     float phi = 6.28318530718 * r1;
-    float r = sqrt(r2);
+    float r = sqrt(r2v);
     vec3 t = normalize(cross(abs(n.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0), n));
     vec3 b = cross(n, t);
-    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - r2)));
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - r2v)));
+}
+
+vec3 cosineSample(vec3 n, inout uint seed)
+{
+    float r1 = rand(seed), r2v = rand(seed);
+    return cosineSampleRn(n, r1, r2v);
 }
 
 // ---------------------------------------------------------------------------
@@ -392,8 +422,12 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         // Lobe selection probability equals each lobe's energy share, so the
         // probability and the lobe weight cancel — throughput is only ever
         // multiplied by the lobe tint, never divided.
+        // First bounce draws from the low-discrepancy stream (set in main);
+        // deeper bounces use white noise.
+        float lobeR = bounce == 0 ? g_LdLobe : rand(seed);
+        vec2 dirR = bounce == 0 ? g_LdDir : vec2(rand(seed), rand(seed));
         bool doDiffuse = false;
-        if (rand(seed) < metallic) {
+        if (lobeR < metallic) {
             // Rough metal: GGX VNDF sample; weight = G2/G1, tint = albedo
             // (stand-in for conductor Fresnel in this factor-only model).
             float alpha = max(roughness * roughness, 1e-3);
@@ -402,7 +436,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             vec3 Vts = vec3(dot(-rd, t), dot(-rd, b), dot(-rd, n));
             if (Vts.z <= 0.0)
                 break; // view grazes under the shading normal
-            vec3 Hts = sampleGGXVNDF(Vts, alpha, rand(seed), rand(seed));
+            vec3 Hts = sampleGGXVNDF(Vts, alpha, dirR.x, dirR.y);
             vec3 H = t * Hts.x + b * Hts.y + n * Hts.z;
             vec3 newRd = reflect(rd, H);
             float ndl = dot(newRd, n);
@@ -429,7 +463,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             vec3 Vts = vec3(dot(-rd, t), dot(-rd, b), dot(-rd, n));
             if (Vts.z <= 0.0)
                 break; // view grazes under the shading normal
-            vec3 Hts = sampleGGXVNDF(Vts, alpha, rand(seed), rand(seed));
+            vec3 Hts = sampleGGXVNDF(Vts, alpha, dirR.x, dirR.y);
             vec3 H = t * Hts.x + b * Hts.y + n * Hts.z;
             float lamV = ggxLambda(alpha, Vts.z);
 
@@ -489,7 +523,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
                     radiance += throughput * (albedo / PI) * ndlp * u_LightColor[i] * atten;
             }
 
-            rd = cosineSample(n, seed);
+            rd = cosineSampleRn(n, dirR.x, dirR.y);
             ro = pos;
             throughput *= albedo;
             specularRay = false;
@@ -519,15 +553,25 @@ void main()
     vec3 sum = vec3(0.0);
     vec3 guideAlbedo = vec3(1.0), guideNormal = vec3(0.0);
     float guideT = 1e30;
+    uint pixelHash = (uint(px.x) * 0x9E3779B1u) ^ (uint(px.y) * 0x85EBCA77u);
+    vec2 rotAA = cpRotation(pixelHash, 1u);
+    vec2 rotLens = cpRotation(pixelHash, 2u);
+    vec2 rotDir = cpRotation(pixelHash, 3u);
+    vec2 rotLobe = cpRotation(pixelHash, 4u);
+
     for (int s = 0; s < u_SamplesPerPass; ++s) {
-        // Seed from the monotonic frame index so noise changes per frame while
-        // the camera moves instead of freezing into a static pattern.
+        // The accumulated sample count indexes the per-pixel low-discrepancy
+        // sequence (it must be the global index, not the frame index, so the
+        // sequence keeps stratifying across the whole accumulation).
+        uint ldIndex = uint(u_SampleIndex + s);
+        // Seed from the monotonic frame index so the white-noise dims change
+        // per frame while the camera moves instead of freezing into a pattern.
         uint seed = (uint(px.x) * 1973u + uint(px.y) * 9277u + uint(u_FrameIndex) * 26699u +
                      uint(s) * 9781u) | 1u;
         pcg(seed); // warm-up: decorrelate the first draw
 
-        // Jittered primary ray (fresh AA jitter per sub-sample).
-        vec2 uv = (vec2(px) + vec2(rand(seed), rand(seed))) / vec2(size);
+        // Jittered primary ray (stratified AA jitter per sub-sample).
+        vec2 uv = (vec2(px) + r2(ldIndex, rotAA)) / vec2(size);
         vec4 pNear = u_InvViewProj * vec4(uv * 2.0 - 1.0, -1.0, 1.0);
         vec4 pFar = u_InvViewProj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
         vec3 ro = pNear.xyz / pNear.w;
@@ -537,11 +581,15 @@ void main()
         // the focal point so the focus plane stays sharp and everything else blurs.
         if (u_Aperture > 0.0) {
             vec3 focalPoint = ro + rd * u_FocusDist;
-            float r = u_Aperture * sqrt(rand(seed));
-            float phi = 6.28318530718 * rand(seed);
+            vec2 lens = r2(ldIndex, rotLens);
+            float r = u_Aperture * sqrt(lens.x);
+            float phi = 6.28318530718 * lens.y;
             ro += u_CamRight * (r * cos(phi)) + u_CamUp * (r * sin(phi));
             rd = normalize(focalPoint - ro);
         }
+
+        g_LdDir = r2(ldIndex, rotDir);
+        g_LdLobe = r2(ldIndex, rotLobe).x;
 
         vec3 sa, sn;
         float st;
